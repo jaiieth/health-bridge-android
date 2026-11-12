@@ -1,0 +1,4 @@
+<resources>
+  <string name="app_name">Health Bridge</string>
+  <string name="permission_rationale">Health Bridge reads sleep, HRV, resting heart rate, heart rate samples, steps and exercise and sends them to your saved HTTPS webhook. All six permissions are required. You can revoke access in Health Connect. Queued health data remains on this device until delivered. Tests send no health records.</string>
+</resources>

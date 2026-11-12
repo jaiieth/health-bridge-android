@@ -1,0 +1,12 @@
+openjdk version "17.0.21" 2026-10-20
+OpenJDK Runtime Environment Temurin-17.0.21+9 (build 17.0.21+9)
+OpenJDK 64-Bit Server VM Temurin-17.0.21+9 (build 17.0.21+9, mixed mode, sharing)
+Warning: This version only understands SDK XML versions up to 3 but an SDK XML file of version 4 was encountered. This can happen if you use versions of Android Studio and the command-line tools that were released at different times.
+Installed packages:
+  Path                 | Version | Description                    | Location            
+  -------              | ------- | -------                        | -------             
+  build-tools;34.0.0   | 34.0.0  | Android SDK Build-Tools 34     | build-tools/34.0.0  
+  build-tools;35.0.0   | 35.0.0  | Android SDK Build-Tools 35     | build-tools/35.0.0  
+  platform-tools       | 37.0.1  | Android SDK Platform-Tools     | platform-tools      
+  platforms;android-35 | 2       | Android SDK Platform 35, rev 2 | platforms/android-35
+
