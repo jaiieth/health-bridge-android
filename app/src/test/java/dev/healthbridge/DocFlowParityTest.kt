@@ -11,7 +11,11 @@ class DocFlowParityTest {
     private val document = File(root, "docs/ux-flows.md")
     private val text = document.readText()
     private val declaration = Regex("\\b(?:class|interface|object)\\s+([A-Z][A-Za-z0-9_]*)")
-    private val declarations = File(root, "app/src").walkTopDown()
+    private val productionDeclarations = File(root, "app/src/main").walkTopDown()
+        .filter { it.isFile && it.extension in setOf("kt", "java") }
+        .flatMap { declaration.findAll(it.readText()).map { match -> match.groupValues[1] } }
+        .toSet()
+    private val citationDeclarations = File(root, "app/src").walkTopDown()
         .filter { it.isFile && it.extension in setOf("kt", "java") }
         .flatMap { declaration.findAll(it.readText()).map { match -> match.groupValues[1] } }
         .toSet()
@@ -33,7 +37,7 @@ class DocFlowParityTest {
             checkedDocument.readText().lineSequence()
                 .filter { it.startsWith("|") && it.contains("Not implemented", ignoreCase = true) }
                 .forEach { row ->
-                    val named = identifier.findAll(row).map { it.value }.filter { it in declarations }.toSet()
+                    val named = identifier.findAll(row).map { it.value }.filter { it in productionDeclarations }.toSet()
                     assertTrue("${checkedDocument.relativeTo(root)} says Not implemented for existing source classes: ${named.sorted().joinToString()}", named.isEmpty())
                 }
         }
@@ -50,7 +54,7 @@ class DocFlowParityTest {
             }.toSet()
             assertTrue("${citedDocument.relativeTo(root)} must cite source classes", names.isNotEmpty())
             names.forEach { name ->
-                assertTrue("${citedDocument.relativeTo(root)} cites undeclared source class: $name", name in declarations)
+                assertTrue("${citedDocument.relativeTo(root)} cites undeclared source class: $name", name in citationDeclarations)
             }
         }
     }
