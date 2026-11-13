@@ -42,6 +42,31 @@ object Transport {
             .retryOnConnectionFailure(false)
             .build()
 
+    suspend fun sendEmpty(
+        endpoint: String,
+        token: String,
+        batch: EmptyTest,
+        beforeSend: suspend () -> Unit,
+        prepare: (Request) -> (() -> Int) = { request ->
+            val call = client.newCall(request)
+            val execute: () -> Int = { call.execute().use { it.code } }
+            execute
+        },
+    ): Int {
+        require(token.isNotBlank())
+        val body = batch.body
+        val request = Request.Builder()
+            .url(validateUrl(endpoint))
+            .header("Authorization", "Bearer $token")
+            .header("X-Health-Bridge-Signature", "sha256=" + signature(body, token))
+            .header("X-Health-Bridge-Batch-Id", batch.batchId)
+            .post(body.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
+        val execute = prepare(request)
+        beforeSend()
+        return execute()
+    }
+
     fun send(endpoint: String, token: String, batch: Pending): Int {
         val request =
             Request.Builder()

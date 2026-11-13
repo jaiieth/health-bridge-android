@@ -96,7 +96,7 @@ class MainActivity : ComponentActivity() {
                                         "Pending batch locks endpoint and token until delivery succeeds"
                                     }
                                     current.save(url, secret, interval)
-                                    Schedule.periodic(this@MainActivity, interval)
+                                    Schedule.pauseHealth(this@MainActivity)
                                     "Settings saved"
                                 }
                                 .getOrElse { it.message ?: "Could not save settings" }
@@ -140,7 +140,7 @@ class MainActivity : ComponentActivity() {
                 delay(2000)
             }
         }
-        if (settings.endpoint.isNotBlank()) Schedule.periodic(this, settings.minutes)
+        Schedule.pauseHealth(this)
     }
 
     override fun onStart() {

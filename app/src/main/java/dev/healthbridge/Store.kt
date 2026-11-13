@@ -1,6 +1,7 @@
 package dev.healthbridge
 
 import android.content.Context
+import android.content.SharedPreferences
 import androidx.room.*
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
@@ -60,8 +61,8 @@ abstract class BridgeDb : RoomDatabase() {
     abstract fun store(): Store
 }
 
-class Settings(context: Context) {
-    private val prefs =
+class Settings(private val prefs: SharedPreferences) : SyncSettings {
+    constructor(context: Context) : this(
         EncryptedSharedPreferences.create(
             context,
             "settings",
@@ -69,14 +70,21 @@ class Settings(context: Context) {
             EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
         )
-    val endpoint
+    )
+    override val endpoint
         get() = prefs.getString("endpoint", "")!!
 
-    val token
+    override val token
         get() = prefs.getString("token", "")!!
 
     val minutes
         get() = prefs.getLong("minutes", 360)
+
+    override var syncEnabled: Boolean
+        get() = prefs.getBoolean("sync_enabled", false)
+        set(value) {
+            prefs.edit().putBoolean("sync_enabled", value).commit()
+        }
 
     fun save(endpoint: String, token: String, minutes: Long) {
         require(
