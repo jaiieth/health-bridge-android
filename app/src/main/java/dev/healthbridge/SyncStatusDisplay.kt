@@ -13,7 +13,7 @@ object SyncStatusDisplay {
         IO_FAILURE("Storage failure", "warning"), OFF("OFF", "stop"), BLOCKED("Blocked", "warning"), PAUSED("Paused", "pause"),
         WAITING("ON, waiting / paused", "clock"), UNKNOWN("Unknown", "help"), GATED("Build gated", "pause")
     }
-    data class Display(val state: State, val reason: String, val action: String)
+    data class Display(val state: State, val reason: String, val action: String, val recordedOutcome: String? = null)
     data class Snapshot(
         val enabled: Boolean,
         val configured: Boolean,
@@ -93,7 +93,14 @@ object SyncStatusDisplay {
     fun format(s: Snapshot): Display = when {
         !s.freshChunkingEnabled -> Display(State.GATED, buildUnavailableReason,
             if (s.enabled) "Consent is saved. This build cannot deliver health data yet. You can turn saved consent OFF. Send test remains separate."
-            else "Saved consent is OFF. Enabling health sync is unavailable. Send test remains separate.")
+            else "Saved consent is OFF. Enabling health sync is unavailable. Send test remains separate.",
+            recordedOutcome = when {
+                recorded(s.result) != null || s.result == "Health sync PAUSED: legacy Pending preserved; delivery blocked" ->
+                    "Recorded past result: ${progress(s.result)}"
+                s.result == "Health sync PAUSED: containment stage" ->
+                    "Recorded past result: Health sync was paused during containment."
+                else -> null
+            })
         !s.enabled -> Display(State.OFF, "Automatic sync is off. Retained data is kept.", "An already active empty test may finish. Send test is separate from health sync.")
         s.result == "BLOCKED: empty Test acceptance unknown; no automatic retry" -> Display(State.BLOCKED, "Empty test acceptance is unknown. Health delivery remains paused.", "No automatic retry will run. Check the receiver before another explicit test.")
         s.result == "Health sync PAUSED: containment stage" -> Display(State.PAUSED, "Health sync is paused during containment.", "ON records your preference. It does not deliver health data.")

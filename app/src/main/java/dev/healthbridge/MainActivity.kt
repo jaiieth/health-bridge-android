@@ -260,7 +260,8 @@ class MainActivity : ComponentActivity() {
                     SyncStatusDisplay.State.WAITING -> R.color.hb_waiting
                     SyncStatusDisplay.State.UNKNOWN -> R.color.hb_unknown
                 })
-                status.text = getString(R.string.status_details, display.state.label, display.reason, display.action)
+                status.text = getString(R.string.status_details, display.state.label, display.reason, display.action) +
+                    (display.recordedOutcome?.let { "\n$it" } ?: "")
                 status.setTextColor(stateColor)
                 stateIcon.setImageResource(when (display.state) {
                     SyncStatusDisplay.State.OFF -> R.drawable.ic_stop

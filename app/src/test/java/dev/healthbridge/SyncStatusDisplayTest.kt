@@ -17,6 +17,38 @@ class SyncStatusDisplayTest {
                 assertEquals("Build gated", display.state.label)
                 assertEquals("Health sync unavailable in this build - resource safety pending", display.reason)
                 assertTrue(display.action.contains(if (consent) "Consent is saved" else "Saved consent is OFF"))
+                assertEquals(if (result == "Ready") null else "Recorded past result: ${SyncStatusDisplay.progress(result)}",
+                    display.recordedOutcome)
+            }
+        }
+    }
+
+    @Test fun gatedRecordedOutcomesRemainHistoricalForEitherSavedConsent() {
+        val outcomes = mapOf(
+            "Health sync BLOCKED: 2/3; HTTP_400" to "The receiver rejected the request with HTTP 400.",
+            "Health sync PAUSED: 2/3; UNKNOWN_ACCEPTANCE" to "Receiver acceptance is unknown. Check the receiver before any resend.",
+            "Health sync PAUSED: 2/3; ENDPOINT_CHANGED" to "The endpoint differs from the retained batch destination.",
+            "Health sync ACK: 2/3; NONE" to "1 of 3 chunks have recorded acknowledgements.",
+            "Health sync DONE: 3/3; NONE" to "Health sync completion is recorded.",
+            "Health sync PAUSED: containment stage" to "Health sync was paused during containment.",
+        )
+        for (consent in listOf(false, true)) {
+            outcomes.forEach { (result, expected) ->
+                val display = SyncStatusDisplay.format(snapshot(consent, result).copy(freshChunkingEnabled = false))
+                assertEquals(SyncStatusDisplay.State.GATED, display.state)
+                assertEquals(SyncStatusDisplay.buildUnavailableReason, display.reason)
+                assertTrue(display.action.contains(if (consent) "Consent is saved" else "Saved consent is OFF"))
+                val outcome = requireNotNull(display.recordedOutcome)
+                assertTrue(outcome.startsWith("Recorded past result: "))
+                assertTrue(outcome.contains(expected))
+                if (result.contains("UNKNOWN_ACCEPTANCE")) assertTrue(outcome.contains("No automatic resend will run."))
+            }
+            for (result in listOf("Ready", "unrecognized", "Sync delivered: HTTP 204")) {
+                val display = SyncStatusDisplay.format(snapshot(consent, result).copy(
+                    freshChunkingEnabled = false, lastSuccess = "2026-01-01T00:00:00Z"))
+                assertEquals(SyncStatusDisplay.State.GATED, display.state)
+                assertNull(display.recordedOutcome)
+                assertFalse(display.toString().contains("completion is recorded"))
             }
         }
     }
