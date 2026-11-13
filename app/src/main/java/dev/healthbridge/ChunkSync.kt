@@ -41,6 +41,9 @@ internal class ChunkSync(
     ): ChunkStatus {
         if (!enabled) return ChunkStatus(ChunkPhase.PLAN, reason = ChunkReason.FLAG_OFF)
         if (cursors.hasLegacyPending()) return ChunkStatus(ChunkPhase.BLOCKED, reason = ChunkReason.LEGACY_PENDING)
+        outbox.recoverStaging()?.let {
+            return ChunkStatus(if (it == ChunkReason.IO_FAILURE) ChunkPhase.PAUSED else ChunkPhase.BLOCKED, reason = it)
+        }
         try { outbox.reclaimDone(cursors) } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (_: Exception) {

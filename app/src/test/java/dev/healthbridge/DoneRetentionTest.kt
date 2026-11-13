@@ -73,7 +73,7 @@ class DoneRetentionTest {
         assertEquals(manifests.last().generation, outbox.load()!!.generation)
         val after = inventory(root)
         repeat(4) { runBlocking { ChunkOutbox(root).reclaimDone(cursors) }; assertEquals(after, inventory(root)) }
-        assertTrue(outbox.controlBytes() <= OUTBOX_CONTROL_QUOTA_BYTES)
+        assertTrue(outbox.controlBytes() <= OUTBOX_CONTROL_RESERVE_BYTES)
         assertTrue(outbox.retainedBytes() <= OUTBOX_HARD_QUOTA_BYTES)
     }
 
@@ -171,7 +171,8 @@ class DoneRetentionTest {
         val (root, cursors, manifests) = fixture()
         val outbox = ChunkOutbox(root)
         val firstBytes = File(root, manifests.first().generation).walkTopDown().filter { it.isFile }.sumOf { it.length() }
-        outbox.recordBackpressure(ChunkReason.OUTBOX_QUOTA, "next-generation", OUTBOX_HARD_QUOTA_BYTES + firstBytes)
+        outbox.recordBackpressure(ChunkReason.OUTBOX_QUOTA, "next-generation",
+            OUTBOX_HARD_QUOTA_BYTES - OUTBOX_CONTROL_RESERVE_BYTES + outbox.controlBytes() + firstBytes)
         assertEquals(ChunkReason.OUTBOX_QUOTA, outbox.backpressure())
         val before = outbox.retainedBytes()
         runBlocking { outbox.reclaimDone(cursors) }
@@ -192,12 +193,12 @@ class DoneRetentionTest {
         })
         repeat(24) { complete(root, cursors, it + 1, count = 1, files = files) }
         assertTrue(payloadPeak <= OUTBOX_HARD_QUOTA_BYTES)
-        assertTrue(controlPeak <= OUTBOX_CONTROL_QUOTA_BYTES)
+        assertTrue(controlPeak <= OUTBOX_CONTROL_RESERVE_BYTES)
         val outbox = ChunkOutbox(root)
         assertEquals(3, root.listFiles()!!.count { it.isDirectory })
         val receipts = root.listFiles()!!.filter { it.name.startsWith("receipt-") }
         assertEquals(COMPLETED_RECEIPT_COUNT, receipts.size)
         assertTrue(receipts.all { it.length() <= 2048 })
-        assertTrue(outbox.controlBytes() <= OUTBOX_CONTROL_QUOTA_BYTES)
+        assertTrue(outbox.controlBytes() <= OUTBOX_CONTROL_RESERVE_BYTES)
     }
 }

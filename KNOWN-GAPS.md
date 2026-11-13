@@ -10,37 +10,49 @@ planning pass, then replays with the same child IDs and verifies every record ID
 and child body hash before publication. Replay reuses the planned metadata lists.
 Source changes fail closed. Health Connect does not provide an immutable snapshot here.
 
-There are two disjoint content-byte budgets.
+There is one 67,108,864-byte total content envelope for all app-controlled logical
+files under the outbox root.
 
-- Payload is capped at 67,108,864 bytes. `retainedBytes()` includes bodies, manifests,
+- Payload is capped inside that total after reserving a 65,536-byte control slice.
+  `retainedBytes()` includes bodies, manifests,
   immutable publication snapshots, reservation sidecars, unknown files, and their temps.
-- Controls are capped at 65,536 bytes. Only root-level active, active-proof, previous,
-  backpressure, receipt files and their temps are controls. Each record is at most
+- Controls use at most 65,536 bytes inside the total, never in addition to it. Only
+  root-level active, active-proof, previous, backpressure, staging-tombstone, receipt
+  files and their temps are controls. Each record is at most
   2048 bytes. Atomic writes check existing control bytes plus the new copy before writing.
   Stage B caps receipt count at 16. Unknown contents are not silently deleted.
 
-Payload admission computes `R = retainedPayload + bodyBytes + 3 * manifestBound + 256`.
+Admission exposes `peak = retainedPayload + controlBytes + bodyBytes + 3 * manifestBound + 256`.
+It requires `peak <= 67,108,864` and separately keeps the payload portion within
+`67,108,864 - 65,536` so future controls have reserved room inside the same ceiling.
 The three manifest copies cover immutable `published.json`, current `manifest.json`,
 and its replacement temp during SEND/ACK/COMMIT/DONE. A new body has either its temp
 or final name, never both. The bounded, immutable reservation sidecar fits within 256
-bytes. The same stored reservation governs resumed saves; it is not reduced on restart.
+bytes. Version 2 reservations contain version, generation, retained payload, planned
+bodies, manifest bound, total peak, total limit, and existing controls. Version 1
+reservations remain readable only when their original arithmetic validates.
+The same stored reservation governs resumed saves; it is not reduced on restart.
 The accepted allocation-free ManifestByteBudget is unchanged and runs before JSON
 construction. It is a conservative encoded-size bound, not an exact encoded length.
 Exact body byte counts come from planning. Existing retained generations, including
 all delivered generations in Stage A, reduce admission capacity.
 
 Control admission keeps 8192 bytes available for pointer/proof replacements during an
-attempt. Refusal remains writable at a full payload budget without exceeding either
-cap. Logical budget separation cannot make an actually full filesystem writable; real
+attempt. Refusal remains writable at a full payload budget without exceeding
+the total. The internal control reserve cannot make an actually full filesystem writable; real
 ENOSPC can still prevent a durable status write. Existing 1 MiB free-space headroom is
-separate from both content-byte quotas. Filesystem blocks, inode overhead, and unrelated
+separate from the logical content-byte envelope. Filesystem blocks, inode overhead, and unrelated
 writers outside the application's mutex are not covered by content-byte arithmetic.
 
 A single bounded backpressure record contains version, reason, generation, required
-peak, payload quota, retained payload at refusal, and manifest budget. Repeated blocked
-runs check it before collection. It clears only after enough payload is actually released
-to fit, a quota/manifest-budget change, or an explicit retry request through the internal
-API. No user-facing setting is added. Refused runs preserve byte-identical file inventories
+peak, total quota, retained payload at refusal, manifest budget, and existing control
+bytes. This is version 2 with eight fields. Older or unknown marker versions return
+read-only BLOCKED/CORRUPT_OUTBOX without clearing or deleting any data. Repeated blocked
+runs check it before collection. It clears only after enough total space is actually
+released to fit both the total and its internal control reserve, a quota/manifest-budget change, or an explicit internal
+retry that rechecks quota fit. Retrying cannot evict any of the three retained
+completions. No user-facing setting is added. Refused runs preserve byte-identical
+file inventories
 after the first marker write. IO_FAILURE is returned through ChunkStatus and the existing
 status persistence path; a rollback does not create a second outbox IO refusal marker.
 
@@ -55,7 +67,7 @@ IO_FAILURE, not delivery success. Legacy fresh pointers remain readable without 
 
 Reasons are distinct and have literal messages in SyncStatusDisplay.
 
-- OUTBOX_QUOTA means cumulative payload storage prevents admission.
+- OUTBOX_QUOTA means cumulative storage inside the total envelope prevents admission.
 - MANIFEST_LIMIT means manifest metadata exceeds its byte budget.
 - GENERATION_RECORD_LIMIT and GENERATION_CHILD_LIMIT identify generation caps.
 - OVERSIZED means a single record cannot fit.
@@ -68,16 +80,35 @@ Reasons are distinct and have literal messages in SyncStatusDisplay.
 | --- | --- |
 | Planning or quota refusal | No body exists. Durable backpressure prevents recollection. |
 | Caught body/manifest write failure before pointer publication | Only this attempt's known, unpublished files are removed; parent is fsynced. Prior pointer and pending data survive. |
-| Process death during staging or cleanup | Unpublished directories are ignored and counted. Unknown files are never guessed to be disposable. |
+| Process death during staging or cleanup | Startup reclaims at most one strictly proven, unreferenced staging attempt using a durable evidence tombstone. Ambiguous directories stay counted and fail closed. |
 | New proof written, active ID still old | Authenticated previous generation remains selected. |
 | Active renamed before directory fsync | New publication is accepted only after hash/structure checks; otherwise previous is selected. Resume fences precede sends. |
 | SEND persisted, response or ACK persistence lost | UNKNOWN_ACCEPTANCE prevents automatic resend. |
 | Cursor transaction fails | COMMIT remains resumable without resending acknowledged children. |
 | Cursor committed, DONE write fails | Durable phase reload re-commits identical targets before DONE. No cursor rollback. |
 
-A process death during rollback can leave ignored, counted bytes. There is no automatic
-restart deletion of unproven directories or durable identity cache for fully rolled-back
-attempts. Such attempts can require recollection; committed quota/manifest refusals do not.
+Startup recovery runs after the legacy Pending guard and before retention, loading, or
+collection. It requires a strictly parsed matching reservation, no reference from any
+active/proof/previous pointer or temp, no receipt, and only whitelisted regular files.
+Existing manifests and their temps must decode, match the generation and recomputed
+parent fingerprint, have phase STAGE or BLOCKED, exclude UNKNOWN_ACCEPTANCE and all
+sent/ACK timestamps or flags, and agree exactly on child lists. Missing or corrupt
+reservations, unknown files, symlinks, subdirectories, dangling or unauthenticated
+pointers, delivery evidence, and ambiguous metadata cause CORRUPT_OUTBOX or IO_FAILURE
+with no recovery deletion. Recognised DONE history and receipt-owned retention remain
+under the existing retention policy. Legacy Pending prevents the recovery pass entirely.
+
+Before deletion, recovery atomically writes and fsyncs one bounded staging tombstone.
+Its 11 fields are version, generation, retained payload, bodies, manifest bound, peak,
+limit, existing controls, initial evidence digest, before-inventory digest, and
+after-inventory digest. Each deletion first durably records the exact before/after
+inventory digests. Recovery revalidates remaining evidence and accepts only one of
+those two inventories. Bodies go first, then metadata and reservation, then the
+directory, with directory syncs at each boundary. The tombstone clears only after the
+directory is gone and the parent is synced. A restart resumes at most that one
+generation. Attempts without proof remain counted and may require operator remediation;
+absence of an active pointer never authorizes deletion. Fully reclaimed attempts can
+require recollection; committed quota/manifest refusals do not.
 If active rename already occurred, cleanup preserves that complete referenced generation
 instead of deleting it after a reported I/O failure. It does not promise zero growth at
 that publication boundary. Pre-publication body/manifest IOException fixtures prove
@@ -112,8 +143,8 @@ At most 16 completed receipts are retained. Before adding a seventeenth, the old
 valid receipt whose generation directory is already absent and is not pointer-referenced
 is removed and the parent is synced. A receipt for an in-progress release is never
 retired. Unknown receipts are never evicted. This explicitly bounds local history;
-older pruned history is not retained indefinitely. The 64 KiB control cap independently
-includes all receipt and pointer atomic coexistence. With 16 maximum-sized receipts,
+older pruned history is not retained indefinitely. The internal 64 KiB control slice
+includes all receipt and pointer atomic coexistence within the single 64 MiB total. With 16 maximum-sized receipts,
 their replacement/new temp and the bounded pointer/refusal records fit this cap.
 
 The three retained generations remain in payload accounting during every future
@@ -156,11 +187,11 @@ partial temporary body/manifest failures, stable refusal inventories, same-reser
 retry, unknown-file preservation, and pointer-rename crash/fallback. DoneRetentionTest
 covers N=3 retention, literal tombstone hashes/byte totals, every release boundary,
 every atomic tombstone boundary, cursor/legacy proof rechecks, corrupt metadata,
-receipt caps, both budgets at atomic peaks, and safe clearing of quota backpressure.
+receipt caps, the total envelope and its control slice at atomic peaks, and safe clearing of quota backpressure.
 Existing durability and containment tests remain in the forced full runs. Assertions
 that required orphan retention or mislabeled quota/manifest refusals as OVERSIZED were
 updated to the newly authorized behavior; their test identities were retained.
 
 Keeping three large full completions can itself leave insufficient space for a new
 generation. The approved policy then requires backpressure rather than evicting one
-of those three or exceeding the payload quota. No automatic policy override is added.
+of those three or exceeding the total envelope. No automatic policy override is added.

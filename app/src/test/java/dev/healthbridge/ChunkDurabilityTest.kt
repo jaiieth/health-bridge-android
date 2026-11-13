@@ -24,7 +24,7 @@ class ChunkDurabilityTest {
             assertTrue(oldFiles.isNotEmpty())
             h.fault = { _, _ -> }
             assertEquals(ChunkPhase.DONE, h.run().phase)
-            oldFiles.forEach { (path, bytes) -> assertEquals(bytes, File(path).readBytes().toList()) }
+            oldFiles.keys.forEach { path -> assertFalse(File(path).exists()) }
             assertEquals(2, h.sent.size)
         }
     }

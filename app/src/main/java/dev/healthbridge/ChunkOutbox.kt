@@ -13,7 +13,7 @@ import org.json.JSONObject
 
 internal const val STAGE_HEADROOM_BYTES = 1_048_576L
 internal const val OUTBOX_HARD_QUOTA_BYTES = 64L * 1024 * 1024
-internal const val OUTBOX_CONTROL_QUOTA_BYTES = 64L * 1024
+internal const val OUTBOX_CONTROL_RESERVE_BYTES = 64L * 1024
 private const val CONTROL_RECORD_BYTES = 2048
 internal const val RETAINED_DONE_GENERATIONS = 3
 internal const val COMPLETED_RECEIPT_COUNT = 16
@@ -125,21 +125,21 @@ internal class ChunkOutbox(
     }
 
     fun save(manifest: ChunkManifest) {
+        check(retainedBytes() + controlBytes() + manifestEncodedBytes(manifest) <= OUTBOX_HARD_QUOTA_BYTES)
         val reservation = File(generation(manifest.generation), "reservation")
         if (reservation.exists()) {
             val fields = reservation.readLines()
             check(manifestEncodedBytes(manifest) <= fields[4].toLong())
-            check(retainedBytes() + manifestEncodedBytes(manifest) <= fields[5].toLong())
+            check(retainedBytes() + manifestEncodedBytes(manifest) <= fields[5].toLong() - (if (fields[0] == "2") fields[7].toLong() else 0))
         }
         files.write(File(generation(manifest.generation), "manifest.json"), encode(manifest).toByteArray(Charsets.UTF_8))
     }
 
     internal data class Reservation(val generation: String, val retained: Long, val bodies: Long,
-        val manifest: Long, val peak: Long, val limit: Long)
+        val manifest: Long, val peak: Long, val limit: Long, val controls: Long = 0)
 
-    // Payload peak = retained payload + bodies + 3 * manifest bound + 256 reservation bytes.
-    // One immutable publication manifest plus current manifest and its replacement temp coexist.
-    // New bodies have only a temp OR final name. Controls have a separate fixed 64 KiB budget.
+    // The control slice is reserved inside the hard total, including atomic control-write copies.
+    // Publication, current manifest and a replacement temp can coexist; bodies have one name.
     fun reserve(manifest: ChunkManifest, bodies: Long, limit: Long = OUTBOX_HARD_QUOTA_BYTES): Reservation {
         generation(manifest.generation)
         require(bodies >= 0 && limit in 0..OUTBOX_HARD_QUOTA_BYTES)
@@ -149,12 +149,14 @@ internal class ChunkOutbox(
             throw ChunkBudgetExceeded(ChunkReason.MANIFEST_LIMIT)
         }
         val retained = retainedBytes()
-        val peak = Math.addExact(retained, Math.addExact(bodies, 3 * bound + 256))
-        if (peak > limit) {
+        val controls = controlBytes()
+        val payloadPeak = Math.addExact(retained, Math.addExact(bodies, 3 * bound + 256))
+        val peak = Math.addExact(payloadPeak, controls)
+        if (peak > limit || payloadPeak > limit - OUTBOX_CONTROL_RESERVE_BYTES) {
             recordBackpressure(ChunkReason.OUTBOX_QUOTA, manifest.generation, peak, limit)
             throw ChunkBudgetExceeded(ChunkReason.OUTBOX_QUOTA)
         }
-        return Reservation(manifest.generation, retained, bodies, bound, peak, limit)
+        return Reservation(manifest.generation, retained, bodies, bound, peak, limit, controls)
     }
 
     fun recordBackpressure(reason: ChunkReason, generation: String, required: Long, limit: Long = OUTBOX_HARD_QUOTA_BYTES) {
@@ -162,7 +164,7 @@ internal class ChunkOutbox(
         val file = File(root, "backpressure")
         if (file.exists()) return
         if (File(root, "backpressure.tmp").exists()) throw IOException("UNPUBLISHED_BACKPRESSURE")
-        val bytes = listOf("1", reason.name, generation, required.toString(), limit.toString(), retainedBytes().toString(), FreshGenerationLimits().manifestBytes.toString()).joinToString("\n").toByteArray()
+        val bytes = listOf("2", reason.name, generation, required.toString(), limit.toString(), retainedBytes().toString(), FreshGenerationLimits().manifestBytes.toString(), controlBytes().toString()).joinToString("\n").toByteArray()
         files.directory(root)
         try { writeControl(file, bytes, replace = false) }
         catch (e: Exception) {
@@ -176,19 +178,33 @@ internal class ChunkOutbox(
         val file = File(root, "backpressure")
         if (!file.exists() && File(root, "backpressure.tmp").exists()) return ChunkReason.IO_FAILURE
         if (!file.exists()) {
-            if (limit == OUTBOX_HARD_QUOTA_BYTES && retainedBytes() > limit - 8192) {
-                if (allowRetry) recordBackpressure(ChunkReason.OUTBOX_QUOTA, "uncollected", retainedBytes() + 8192, limit)
+            if (limit == OUTBOX_HARD_QUOTA_BYTES && (retainedBytes() > limit - OUTBOX_CONTROL_RESERVE_BYTES - 8192 ||
+                    retainedBytes() + controlBytes() > limit - 8192)) {
+                if (allowRetry) recordBackpressure(ChunkReason.OUTBOX_QUOTA, "uncollected", retainedBytes() + controlBytes() + 8192, limit)
                 return ChunkReason.OUTBOX_QUOTA
             }
             return null
         }
+        if (!file.isFile || file.length() > CONTROL_RECORD_BYTES || Files.isSymbolicLink(file.toPath())) return ChunkReason.CORRUPT_OUTBOX
         val fields = file.readLines()
-        require(fields.size == 7 && fields[0] == "1")
-        val reason = ChunkReason.valueOf(fields[1])
-        val previous = fields[5].toLong()
-        // Only actual release of retained bytes, a changed fixed budget, or explicit retry permits collection.
-        if (explicitRetry || fields[4].toLong() != limit || fields[6].toLong() != FreshGenerationLimits().manifestBytes ||
-            reason == ChunkReason.OUTBOX_QUOTA && fields[3].toLong() - previous <= limit - retainedBytes()) {
+        if (fields.size != 8 || fields[0] != "2") return ChunkReason.CORRUPT_OUTBOX
+        val reason = try {
+            require(file.length() <= CONTROL_RECORD_BYTES && !Files.isSymbolicLink(file.toPath()))
+            generation(fields[2])
+            require(fields[3].toLong() >= 0 && fields[4].toLong() in 0..OUTBOX_HARD_QUOTA_BYTES &&
+                fields[5].toLong() >= 0 && fields[6].toLong() > 0 && fields[7].toLong() >= 0)
+            ChunkReason.valueOf(fields[1]).also { require(it in setOf(ChunkReason.OUTBOX_QUOTA, ChunkReason.MANIFEST_LIMIT, ChunkReason.GENERATION_RECORD_LIMIT,
+                ChunkReason.GENERATION_CHILD_LIMIT, ChunkReason.ENVELOPE_LIMIT, ChunkReason.OVERSIZED, ChunkReason.INVALID_TIMESTAMP)) }
+        } catch (_: Exception) { return ChunkReason.CORRUPT_OUTBOX }
+        val retained = retainedBytes()
+        val currentControls = controlBytes() - file.length()
+        val requiredPayload = if (reason == ChunkReason.OUTBOX_QUOTA)
+            Math.addExact(fields[3].toLong() - fields[7].toLong() - fields[5].toLong(), retained) else Long.MAX_VALUE
+        val changedBudget = fields[4].toLong() != limit || fields[6].toLong() != FreshGenerationLimits().manifestBytes
+        val fits = requiredPayload >= 0 && requiredPayload <= limit - OUTBOX_CONTROL_RESERVE_BYTES && requiredPayload <= limit - currentControls
+        val released = retained + currentControls < fields[5].toLong() + fields[7].toLong()
+        val retry = if (reason == ChunkReason.OUTBOX_QUOTA) (explicitRetry || released) && fits else explicitRetry
+        if (changedBudget || retry) {
             if (!allowRetry) return reason
             Files.delete(file.toPath())
             files.sync(root)
@@ -198,8 +214,8 @@ internal class ChunkOutbox(
     }
 
     fun beginReserved(reservation: Reservation): StagingAttempt {
-        check(reservation.peak <= reservation.limit && retainedBytes() == reservation.retained)
-        check(controlBytes() + 8192 <= OUTBOX_CONTROL_QUOTA_BYTES)
+        check(reservation.peak <= reservation.limit && retainedBytes() == reservation.retained && controlBytes() == reservation.controls)
+        check(controlBytes() + 8192 <= OUTBOX_CONTROL_RESERVE_BYTES)
         preflight(reservation.peak - reservation.retained + STAGE_HEADROOM_BYTES + 8192)
         val dir = generation(reservation.generation)
         if (File(root, "active.tmp").exists()) throw IOException("UNPUBLISHED_ACTIVE_POINTER")
@@ -208,8 +224,8 @@ internal class ChunkOutbox(
         files.directory(dir)
         val attempt = StagingAttempt(this, reservation.generation)
         try {
-            files.write(File(dir, "reservation"), listOf("1", reservation.generation, reservation.retained,
-                reservation.bodies, reservation.manifest, reservation.peak, reservation.limit).joinToString("\n").toByteArray(), replace = false)
+            files.write(File(dir, "reservation"), listOf("2", reservation.generation, reservation.retained,
+                reservation.bodies, reservation.manifest, reservation.peak, reservation.limit, reservation.controls).joinToString("\n").toByteArray(), replace = false)
         } catch (e: Exception) { rollback(attempt); throw e }
         return attempt
     }
@@ -273,17 +289,233 @@ internal class ChunkOutbox(
         files.sync(root)
     }
 
+    private fun readReservation(file: File, id: String): Reservation {
+        require(file.isFile && !Files.isSymbolicLink(file.toPath()) && file.length() <= 256)
+        return parseReservation(file.readLines(), id)
+    }
+
+    private fun parseReservation(fields: List<String>, id: String): Reservation {
+        require((fields.size == 7 && fields[0] == "1") || (fields.size == 8 && fields[0] == "2"))
+        require(fields[1] == id)
+        generation(id)
+        require(fields.drop(2).all { it.matches(Regex("0|[1-9][0-9]*")) })
+        val r = Reservation(id, fields[2].toLong(), fields[3].toLong(), fields[4].toLong(),
+            fields[5].toLong(), fields[6].toLong(), if (fields.size == 8) fields[7].toLong() else 0)
+        require(r.retained in 0..OUTBOX_HARD_QUOTA_BYTES && r.bodies in 0..OUTBOX_HARD_QUOTA_BYTES &&
+            r.manifest in 1..FreshGenerationLimits().manifestBytes && r.limit in 0..OUTBOX_HARD_QUOTA_BYTES &&
+            r.controls in 0..OUTBOX_CONTROL_RESERVE_BYTES)
+        require(r.peak == Math.addExact(Math.addExact(r.retained, r.controls), Math.addExact(r.bodies, 3 * r.manifest + 256)))
+        require(r.peak <= r.limit)
+        return r
+    }
+
+    private val stagingName = Regex("child-([0-9]|[1-9][0-9])\\.json(\\.tmp)?|(manifest|published)\\.json(\\.tmp)?|reservation(\\.tmp)?")
+    private val digestPattern = Regex("[0-9a-f]{64}")
+
+    private fun stagingEntries(dir: File): List<File> {
+        require(dir.isDirectory && !Files.isSymbolicLink(dir.toPath()))
+        val entries = dir.listFiles() ?: throw IOException("DIRECTORY_LIST_FAILED")
+        require(entries.all { it.isFile && !Files.isSymbolicLink(it.toPath()) && stagingName.matches(it.name) })
+        return entries.sortedBy { it.name }
+    }
+
+    private fun stagingEvidence(dir: File, expected: Reservation? = null): Reservation {
+        val entries = stagingEntries(dir)
+        val reservation = File(dir, "reservation")
+        val r = if (reservation.exists()) readReservation(reservation, dir.name) else {
+            require(expected != null && entries.isEmpty())
+            expected
+        }
+        if (expected != null) require(r == expected)
+        entries.filter { it.name == "reservation.tmp" }.forEach { require(readReservation(it, dir.name) == r) }
+        require(entries.filter { it.name.startsWith("child-") }.sumOf { it.length() } <= r.bodies)
+        require(entries.filter { it.name.startsWith("child-") }.all { it.length() <= 524_288 })
+        val manifests = entries.filter { it.name.startsWith("manifest.") || it.name.startsWith("published.") }.map { file ->
+            require(file.length() <= r.manifest)
+            decode(file.readText()).also { m ->
+                require(m.generation == dir.name && m.recordIds.size == m.recordHashes.size)
+                require(m.fingerprint == parentFingerprint(m.endpointHash, m.recordIds, m.recordHashes, m.targets))
+                require(m.phase in setOf(ChunkPhase.STAGE, ChunkPhase.BLOCKED) && m.reason != ChunkReason.UNKNOWN_ACCEPTANCE)
+                require(m.children.none { it.acked || it.sentAt != null || it.ackedAt != null })
+                require(m.children.map { it.index } == m.children.indices.toList())
+            }
+        }
+        require(manifests.map { it.children }.distinct().size <= 1)
+        return r
+    }
+
+    private fun inventoryDigest(dir: File, omit: String? = null): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(8192)
+        for (entry in stagingEntries(dir).filter { it.name != omit }) {
+            digest.update((entry.name.length.toString() + ":" + entry.name + ":" + entry.length() + ":").toByteArray(Charsets.UTF_8))
+            entry.inputStream().use { input ->
+                while (true) {
+                    val size = input.read(buffer)
+                    if (size < 0) break
+                    digest.update(buffer, 0, size)
+                }
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it.toInt() and 255) }
+    }
+
+    private data class StagingTombstone(val reservation: Reservation, val evidence: String, val before: String, val after: String)
+
+    private fun tombstoneBytes(t: StagingTombstone): ByteArray = with(t.reservation) {
+        listOf("1", generation, retained, bodies, manifest, peak, limit, controls, t.evidence, t.before, t.after)
+            .joinToString("\n").toByteArray(Charsets.UTF_8)
+    }
+
+    private fun readTombstone(file: File): StagingTombstone {
+        require(file.isFile && !Files.isSymbolicLink(file.toPath()) && file.length() <= CONTROL_RECORD_BYTES)
+        val fields = file.readLines()
+        require(fields.size == 11 && fields[0] == "1" && fields.takeLast(3).all { digestPattern.matches(it) })
+        val r = parseReservation(listOf("2") + fields.subList(1, 8), fields[1])
+        return StagingTombstone(r, fields[8], fields[9], fields[10])
+    }
+
+    private fun recoveryReferences(): Set<String> {
+        val ids = mutableSetOf<String>()
+        val proofs = listOf("active-proof", "active-proof.tmp", "previous", "previous.tmp")
+        for (name in proofs) {
+            val file = File(root, name)
+            require(!Files.isSymbolicLink(file.toPath()))
+            if (!file.exists()) continue
+            if (!file.isFile) throw IOException("POINTER_NOT_A_FILE")
+            require(file.length() <= CONTROL_RECORD_BYTES)
+            val fields = file.readLines()
+            require(fields.size == 4 && fields[3] in setOf("published", "legacy"))
+            val id = authenticatedPointer(file) ?: error("UNAUTHENTICATED_POINTER")
+            require(generation(id).isDirectory)
+            ids += id
+        }
+        for (name in listOf("active", "active.tmp")) {
+            val file = File(root, name)
+            require(!Files.isSymbolicLink(file.toPath()))
+            if (!file.exists()) continue
+            if (!file.isFile) throw IOException("POINTER_NOT_A_FILE")
+            require(file.length() in 1..100)
+            val id = file.readText()
+            val dir = generation(id)
+            require(dir.isDirectory && !Files.isSymbolicLink(dir.toPath()))
+            if (id !in ids) {
+                require(name == "active" && proofs.none { File(root, it).exists() })
+                require(load()?.generation == id)
+            }
+            ids += id
+        }
+        return ids
+    }
+
+    /** Reclaims at most one fully evidenced unpublished attempt. The caller excludes legacy Pending. */
+    fun recoverStaging(): ChunkReason? = try {
+        if (File(root, "backpressure").exists() && backpressure(allowRetry = false) == ChunkReason.CORRUPT_OUTBOX) ChunkReason.CORRUPT_OUTBOX
+        else if (!root.exists()) null else {
+            require(root.isDirectory && !Files.isSymbolicLink(root.toPath()))
+            val references = recoveryReferences()
+            val tombstone = File(root, "staging-tombstone")
+            val temporary = File(root, "staging-tombstone.tmp")
+            val recorded = when {
+                tombstone.exists() -> readTombstone(tombstone)
+                temporary.exists() -> readTombstone(temporary)
+                else -> null
+            }
+            if (temporary.exists()) {
+                val pending = readTombstone(temporary)
+                require(recorded == null || pending.reservation == recorded.reservation && pending.evidence == recorded.evidence)
+            }
+            var candidate: File? = null
+            var reservation: Reservation? = null
+            val entries = root.listFiles() ?: throw IOException("DIRECTORY_LIST_FAILED")
+            for (entry in entries) {
+                require(!Files.isSymbolicLink(entry.toPath()))
+                if (!entry.isDirectory) continue
+                generation(entry.name)
+                if (entry.name in references) continue
+                if (receiptFile(entry.name).exists()) {
+                    require(readReceipt(receiptFile(entry.name)) != null)
+                    continue
+                }
+                if (recorded?.reservation?.generation == entry.name) continue
+                if (completedManifest(entry) != null) continue
+                val r = stagingEvidence(entry)
+                if (candidate == null) { candidate = entry; reservation = r }
+            }
+            if (recorded != null) {
+                require(recorded.reservation.generation !in references && !receiptFile(recorded.reservation.generation).exists())
+                val dir = generation(recorded.reservation.generation)
+                if (!dir.exists()) {
+                    files.sync(root)
+                    Files.deleteIfExists(temporary.toPath())
+                    Files.deleteIfExists(tombstone.toPath())
+                    files.sync(root)
+                } else {
+                    stagingEvidence(dir, recorded.reservation)
+                    val digest = inventoryDigest(dir)
+                    require(digest == recorded.before || digest == recorded.after)
+                    if (!tombstone.exists()) {
+                        // A temp alone has not authorized deletion. Revalidate full attempt evidence first.
+                        require(digest == recorded.evidence)
+                    }
+                    deleteStaging(dir, recorded.reservation, recorded.evidence)
+                }
+            } else if (candidate != null) {
+                deleteStaging(candidate, checkNotNull(reservation), inventoryDigest(candidate))
+            }
+            null
+        }
+    } catch (_: IOException) { ChunkReason.IO_FAILURE }
+      catch (_: Exception) { ChunkReason.CORRUPT_OUTBOX }
+
+    private fun deleteStaging(dir: File, reservation: Reservation, evidence: String) {
+        val tombstone = File(root, "staging-tombstone")
+        var digest = inventoryDigest(dir)
+        writeControl(tombstone, tombstoneBytes(StagingTombstone(reservation, evidence, digest, digest)))
+        releaseFault(ReleaseBoundary.TOMBSTONE_DURABLE, dir.name)
+        val entries = stagingEntries(dir)
+        val bodies = entries.filter { it.name.startsWith("child-") }
+        val metadata = entries.filter { !it.name.startsWith("child-") }.sortedBy {
+            when (it.name) { "reservation" -> 3; "manifest.json" -> 2; else -> 1 }
+        }
+        for (entry in bodies + metadata) {
+            if (entry == metadata.firstOrNull()) {
+                files.sync(dir)
+                releaseFault(ReleaseBoundary.BODIES_SYNCED, dir.name)
+            }
+            val after = inventoryDigest(dir, entry.name)
+            writeControl(tombstone, tombstoneBytes(StagingTombstone(reservation, evidence, digest, after)))
+            Files.delete(entry.toPath())
+            releaseFault(when {
+                entry.name.startsWith("child-") -> ReleaseBoundary.BODY_REMOVED
+                entry.name == "manifest.json" -> ReleaseBoundary.MANIFEST_REMOVED
+                else -> ReleaseBoundary.METADATA_REMOVED
+            }, dir.name)
+            files.sync(dir)
+            digest = after
+        }
+        files.sync(dir)
+        Files.delete(dir.toPath())
+        releaseFault(ReleaseBoundary.GENERATION_REMOVED, dir.name)
+        files.sync(root)
+        releaseFault(ReleaseBoundary.PARENT_SYNCED, dir.name)
+        Files.deleteIfExists(File(root, "staging-tombstone.tmp").toPath())
+        Files.delete(tombstone.toPath())
+        files.sync(root)
+    }
+
     internal class StagingAttempt internal constructor(internal val owner: ChunkOutbox, internal val generation: String)
 
     private fun isControl(file: File): Boolean = file.parentFile == root &&
-        (file.name.removeSuffix(".tmp") in setOf("active", "active-proof", "previous", "backpressure") ||
+        (file.name.removeSuffix(".tmp") in setOf("active", "active-proof", "previous", "backpressure", "staging-tombstone") ||
             file.name.matches(Regex("receipt-[a-zA-Z0-9-]{1,100}\\.json(\\.tmp)?")))
 
     fun controlBytes(): Long = if (!root.exists()) 0 else root.listFiles()!!.filter { it.isFile && isControl(it) }.sumOf { it.length() }
 
     private fun writeControl(file: File, bytes: ByteArray, replace: Boolean = true) {
         require(isControl(file) && bytes.size <= CONTROL_RECORD_BYTES)
-        if (controlBytes() + bytes.size > OUTBOX_CONTROL_QUOTA_BYTES) throw IOException("CONTROL_BUDGET")
+        if (controlBytes() + bytes.size > OUTBOX_CONTROL_RESERVE_BYTES ||
+            retainedBytes() + controlBytes() + bytes.size > OUTBOX_HARD_QUOTA_BYTES) throw IOException("CONTROL_BUDGET")
         files.write(file, bytes, replace)
     }
 
@@ -351,12 +583,7 @@ internal class ChunkOutbox(
         val reservation = File(dir, "reservation")
         if (reservation.exists()) {
             require(reservation.isFile && reservation.length() <= 256)
-            val fields = reservation.readLines()
-            require(fields.size == 7 && fields[0] == "1" && fields[1] == id)
-            val retained = fields[2].toLong(); val bodies = fields[3].toLong(); val bound = fields[4].toLong()
-            val peak = fields[5].toLong(); val limit = fields[6].toLong()
-            require(retained >= 0 && bodies >= 0 && bound in 1..8L * 1024 * 1024 && limit in 0..OUTBOX_HARD_QUOTA_BYTES)
-            require(peak == Math.addExact(retained, Math.addExact(bodies, 3 * bound + 256)) && peak <= limit)
+            readReservation(reservation, id)
         }
         true
     } catch (_: Exception) { false }

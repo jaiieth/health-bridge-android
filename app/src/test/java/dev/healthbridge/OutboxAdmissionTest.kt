@@ -28,12 +28,12 @@ class OutboxAdmissionTest {
             val root = temporary.newFolder()
             val m = manifest()
             val added = 4 + 3 * manifestEncodedBytes(m) + 256
-            val retained = OUTBOX_HARD_QUOTA_BYTES - added + delta
+            val retained = OUTBOX_HARD_QUOTA_BYTES - OUTBOX_CONTROL_RESERVE_BYTES - added + delta
             RandomAccessFile(File(root, "unknown-pending.tmp"), "rw").use { it.setLength(retained) }
             val outbox = ChunkOutbox(root)
             if (delta <= 0) {
                 val r = outbox.reserve(m, 4)
-                assertEquals(OUTBOX_HARD_QUOTA_BYTES + delta, r.peak)
+                assertEquals(OUTBOX_HARD_QUOTA_BYTES - OUTBOX_CONTROL_RESERVE_BYTES + delta, r.peak)
                 assertEquals(retained, outbox.retainedBytes())
                 assertFalse(File(root, "generation").exists())
             } else {
@@ -59,10 +59,10 @@ class OutboxAdmissionTest {
         val before = inventory(root)
         val second = manifest().copy(generation = "second", recordIds = List(1300) { "\u0000".repeat(1000) },
             recordHashes = List(1300) { "0".repeat(64) })
-        val bodies = OUTBOX_HARD_QUOTA_BYTES - 3 * manifestEncodedBytes(second) - 256
+        val bodies = OUTBOX_HARD_QUOTA_BYTES - OUTBOX_CONTROL_RESERVE_BYTES - 3 * manifestEncodedBytes(second) - 256
         assertTrue(bodies <= 100L * 524_288)
         val empty = ChunkOutbox(temporary.newFolder())
-        assertEquals(OUTBOX_HARD_QUOTA_BYTES, empty.reserve(second, bodies).peak)
+        assertEquals(OUTBOX_HARD_QUOTA_BYTES - OUTBOX_CONTROL_RESERVE_BYTES, empty.reserve(second, bodies).peak)
         assertEquals(ChunkReason.OUTBOX_QUOTA, assertThrows(ChunkBudgetExceeded::class.java) { outbox.reserve(second, bodies) }.reason)
         before.forEach { (path, bytes) -> assertEquals(bytes, inventory(root)[path]) }
         assertFalse(File(root, "second").exists())
@@ -227,11 +227,11 @@ class OutboxAdmissionTest {
         val unknown = File(root, "unknown-pending")
         RandomAccessFile(unknown, "rw").use { it.setLength(OUTBOX_HARD_QUOTA_BYTES) }
         val outbox = ChunkOutbox(root)
-        assertEquals(ChunkReason.OUTBOX_QUOTA, outbox.backpressure())
+        assertThrows(IOException::class.java) { outbox.backpressure() }
         val before = inventory(root)
         val runner = ChunkSync(outbox, FakeChunkCursors(), { _, _ -> error("No send") })
         repeat(5) {
-            assertEquals(ChunkReason.OUTBOX_QUOTA, runBlocking {
+            assertEquals(ChunkReason.IO_FAILURE, runBlocking {
                 runner.run(true, "endpoint", syntheticMapping) { error("No collection") }
             }.reason)
             assertEquals(before, inventory(root))
@@ -253,7 +253,7 @@ class OutboxAdmissionTest {
         assertEquals("next-generation", ChunkOutbox(root).load()!!.generation)
         File(root, "next-generation/published.json").writeText("corrupt snapshot")
         assertEquals("previous-generation", ChunkOutbox(root).load()!!.generation)
-        assertTrue(ChunkOutbox(root).controlBytes() <= OUTBOX_CONTROL_QUOTA_BYTES)
+        assertTrue(ChunkOutbox(root).controlBytes() <= OUTBOX_CONTROL_RESERVE_BYTES)
     }
 
     @Test fun reasonsHaveHonestDistinctMessages() {
