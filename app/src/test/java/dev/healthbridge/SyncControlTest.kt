@@ -1,0 +1,77 @@
+package dev.healthbridge
+
+import android.content.SharedPreferences
+import java.lang.reflect.Proxy
+import org.junit.Assert.*
+import org.junit.Test
+
+class SyncControlTest {
+    private class Fixture(enabled: Boolean) {
+        val values = mutableMapOf<String, Any>("sync_enabled" to enabled, "minutes" to 75L)
+        val calls = mutableListOf<String>()
+        private val staged = mutableMapOf<String, Any>()
+        private val editor: SharedPreferences.Editor = Proxy.newProxyInstance(
+            javaClass.classLoader, arrayOf(SharedPreferences.Editor::class.java)
+        ) { proxy, method, args ->
+            when (method.name) {
+                "putBoolean", "putString", "putLong" -> { staged[args!![0] as String] = args[1]; proxy }
+                "commit" -> { values.putAll(staged); staged.clear(); true }
+                else -> error(method.name)
+            }
+        } as SharedPreferences.Editor
+        private val prefs = Proxy.newProxyInstance(
+            javaClass.classLoader, arrayOf(SharedPreferences::class.java)
+        ) { _, method, args ->
+            when (method.name) {
+                "getBoolean", "getLong", "getString" -> values[args!![0]] ?: args[1]
+                "edit" -> editor
+                else -> error(method.name)
+            }
+        } as SharedPreferences
+        val control = SyncControl(Settings(prefs), object : SyncScheduler {
+            override fun schedule(minutes: Long) { calls += "schedule:$minutes" }
+            override fun cancel() {
+                assertEquals(false, values["sync_enabled"])
+                calls += "cancel"
+            }
+        })
+    }
+
+    @Test fun openingWithEitherStoredPreferenceDoesNoWork() {
+        listOf(false, true).forEach { enabled ->
+            val fixture = Fixture(enabled)
+            assertEquals(emptyList<String>(), fixture.calls)
+            assertEquals(enabled, fixture.values["sync_enabled"])
+        }
+    }
+
+    @Test fun switchOnSchedulesStoredIntervalOnce() {
+        val fixture = Fixture(false)
+        assertTrue(fixture.control.setEnabled(true))
+        assertEquals(true, fixture.values["sync_enabled"])
+        assertEquals(listOf("schedule:75"), fixture.calls)
+    }
+
+    @Test fun switchOffPersistsFalseBeforeCanceling() {
+        val fixture = Fixture(true)
+        assertTrue(fixture.control.setEnabled(false))
+        assertEquals(false, fixture.values["sync_enabled"])
+        assertEquals(listOf("cancel"), fixture.calls)
+    }
+
+    @Test fun saveWhileOnUpdatesStoredIntervalWithoutCanceling() {
+        val fixture = Fixture(true)
+        fixture.control.save("https://example.invalid/hook", "key", 120)
+        assertEquals(120L, fixture.values["minutes"])
+        assertEquals(true, fixture.values["sync_enabled"])
+        assertEquals(listOf("schedule:120"), fixture.calls)
+    }
+
+    @Test fun saveWhileOffDoesNoWork() {
+        val fixture = Fixture(false)
+        fixture.control.save("https://example.invalid/hook", "key", 120)
+        assertEquals(120L, fixture.values["minutes"])
+        assertEquals(false, fixture.values["sync_enabled"])
+        assertEquals(emptyList<String>(), fixture.calls)
+    }
+}

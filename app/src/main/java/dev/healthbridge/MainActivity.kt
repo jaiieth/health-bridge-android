@@ -39,6 +39,12 @@ class MainActivity : ComponentActivity() {
     private var changingControl = false
     private var refreshing = false
     private val enabled get() = Settings(this).syncEnabled
+    private val syncControl by lazy {
+        SyncControl(Settings(this), object : SyncScheduler {
+            override fun schedule(minutes: Long) = Schedule.periodic(this@MainActivity, minutes)
+            override fun cancel() = Schedule.pauseHealth(this@MainActivity)
+        })
+    }
     private val fieldErrors = mutableMapOf<EditText, TextView>()
     private val permissionRequest = registerForActivityResult(
         PermissionController.createRequestPermissionResultContract()
@@ -121,7 +127,7 @@ class MainActivity : ComponentActivity() {
         tokenField = token
         val minutes = input(setup, "Interval in minutes · 15 to 525600", InputType.TYPE_CLASS_NUMBER)
         minutes.setText(getString(R.string.interval_value, settings.minutes))
-        setupMessage = text(setup, "Saving settings pauses health work. It does not turn sync on.")
+        setupMessage = text(setup, "Saving settings updates the interval when sync is ON. It does not turn sync on.")
         setupMessage.accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_ASSERTIVE
         val save = button(setup, "Save settings") {}
         save.setOnClickListener {
@@ -153,8 +159,7 @@ class MainActivity : ComponentActivity() {
                             "A retained batch locks the endpoint and token. Endpoint and token cannot change during containment."
                         } else {
                             runCatching {
-                                current.save(requireNotNull(url), secret, requireNotNull(interval))
-                                Schedule.pauseHealth(this@MainActivity)
+                                syncControl.save(requireNotNull(url), secret, requireNotNull(interval))
                                 "Settings saved. Sync remains ${if (enabled) "ON" else "OFF"}."
                             }.getOrDefault("Could not save settings. Try again.")
                         }
@@ -201,13 +206,7 @@ class MainActivity : ComponentActivity() {
                 lifecycleScope.launch {
                     val ok = withContext(Dispatchers.IO) {
                         AppState.mutex.withLock {
-                            val current = Settings(this@MainActivity)
-                            current.syncEnabled = checked
-                            if (current.syncEnabled == checked) {
-                                if (checked) Schedule.periodic(this@MainActivity, Settings(this@MainActivity).minutes)
-                                else Schedule.pauseHealth(this@MainActivity)
-                                true
-                            } else false
+                            syncControl.setEnabled(checked)
                         }
                     }
                     if (!ok) setupMessage.setText(R.string.control_save_failed)
@@ -217,7 +216,6 @@ class MainActivity : ComponentActivity() {
             }
         }
         lifecycleScope.launch {
-            withContext(Dispatchers.IO) { AppState.mutex.withLock { Schedule.pauseHealth(this@MainActivity) } }
             while (true) { refresh(); delay(2000) }
         }
     }
