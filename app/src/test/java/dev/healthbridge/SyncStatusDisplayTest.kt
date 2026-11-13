@@ -80,7 +80,7 @@ class SyncStatusDisplayTest {
             Case("PLAN", "FLAG_OFF", SyncStatusDisplay.State.OFF, "OFF"),
             Case("DONE", "NONE", SyncStatusDisplay.State.DONE, "Acknowledged"),
             Case("PAUSED", "IO_FAILURE", SyncStatusDisplay.State.IO_FAILURE, "Storage failure"),
-        ) + listOf("LEGACY_PENDING", "HTTP_400", "HTTP_409", "HTTP_413", "HTTP_BLOCKED", "OVERSIZED", "INVALID_TIMESTAMP").map {
+        ) + listOf("LEGACY_PENDING", "HTTP_400", "HTTP_409", "HTTP_413", "HTTP_BLOCKED", "OVERSIZED", "INVALID_TIMESTAMP", "OUTBOX_QUOTA", "MANIFEST_LIMIT", "GENERATION_RECORD_LIMIT", "GENERATION_CHILD_LIMIT", "ENVELOPE_LIMIT").map {
             Case("BLOCKED", it, SyncStatusDisplay.State.BLOCKED, "Blocked")
         } + listOf("CORRUPT_OUTBOX", "UNKNOWN_ACCEPTANCE", "ENDPOINT_CHANGED", "HTTP_RETRY", "INVALID_ACK").map {
             Case("PAUSED", it, SyncStatusDisplay.State.PAUSED, "Paused")
@@ -171,7 +171,12 @@ class SyncStatusDisplayTest {
             "IO_FAILURE" to "Local storage failed. Recorded counts may be unavailable.",
             "CORRUPT_OUTBOX" to "The retained outbox could not be read safely.",
             "ENDPOINT_CHANGED" to "The endpoint differs from the retained batch destination.",
+            "ENVELOPE_LIMIT" to "The delivery envelope exceeds the configured size limit.",
             "OVERSIZED" to "A record exceeds the delivery size limit.",
+            "OUTBOX_QUOTA" to "The fresh-sync outbox has reached its storage admission limit.",
+            "MANIFEST_LIMIT" to "The sync window exceeds the manifest metadata budget.",
+            "GENERATION_RECORD_LIMIT" to "The sync window exceeds the generation record limit.",
+            "GENERATION_CHILD_LIMIT" to "The sync window exceeds the generation chunk limit.",
         )
         assertEquals(ChunkReason.entries.map { it.name }.toSet(), reasons.keys)
         reasons.forEach { (reason, expected) ->

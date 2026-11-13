@@ -44,7 +44,8 @@ class ChunkStreamingIoTest {
                 assertEquals(label, ChunkPhase.PAUSED, status.phase)
                 assertEquals(label, ChunkReason.IO_FAILURE, status.reason)
                 assertNotNull(label, failed)
-                assertEquals(label, failed, snapshot(h.root))
+                if (h.outbox.load() == null) assertTrue(label, snapshot(h.root).isEmpty())
+                else assertEquals(label, failed, snapshot(h.root))
                 assertEquals(label, 0, extraWrites)
                 assertEquals(label, 0, h.cursors.commits)
                 assertEquals(label, mapOf("steps" to "old", "sleep" to "old"), h.cursors.values)
@@ -53,7 +54,8 @@ class ChunkStreamingIoTest {
                 if (saved == null) {
                     assertTrue(label, h.sent.isEmpty())
                     assertFalse(label, File(h.root, "active").exists())
-                    assertEquals(label, failed, snapshot(h.root))
+                    if (h.outbox.load() == null) assertTrue(label, snapshot(h.root).isEmpty())
+                else assertEquals(label, failed, snapshot(h.root))
                 } else {
                     val bodies = saved.children.indices.map { h.outbox.body(saved, it) }
                     val sentBefore = h.sent.size

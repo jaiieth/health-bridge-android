@@ -18,7 +18,7 @@ internal fun interface VerifiedReceiverMapping {
 }
 
 internal data class PlannedChild(val batchId: String, val records: List<ChunkRecord>, val body: ByteArray, val mappedBytes: Long)
-internal enum class ChunkBlockCause { OVERSIZED, INVALID_TIMESTAMP }
+internal enum class ChunkBlockCause { OVERSIZED, INVALID_TIMESTAMP, ENVELOPE_LIMIT }
 internal sealed interface ChunkPlan {
     data class Ready(val children: List<PlannedChild>) : ChunkPlan
     data class Blocked(val recordId: String?, val wireBytes: Long, val mappedBytes: Long?, val count: Int, val cause: ChunkBlockCause = ChunkBlockCause.OVERSIZED) : ChunkPlan
@@ -60,7 +60,7 @@ internal object ChunkPartitioner {
             if (end == start && start < records.size) {
                 return ChunkPlan.Blocked(records[start].recordId, overhead + recordSizes[start], 2 + mappedSizes[start], 1)
             }
-            if (wire > limits.wireBytes || mapped > limits.mappedBytes) return ChunkPlan.Blocked(null, wire, mapped, 0)
+            if (wire > limits.wireBytes || mapped > limits.mappedBytes) return ChunkPlan.Blocked(null, wire, mapped, 0, ChunkBlockCause.ENVELOPE_LIMIT)
             val slice = records.subList(start, end).toList()
             children += PlannedChild(id, slice, envelope(id, slice), mapped)
             start = end

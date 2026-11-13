@@ -11,10 +11,15 @@ import java.security.MessageDigest
 import org.json.JSONArray
 import org.json.JSONObject
 
-private const val STAGE_HEADROOM_BYTES = 1_048_576L
+internal const val STAGE_HEADROOM_BYTES = 1_048_576L
+internal const val OUTBOX_HARD_QUOTA_BYTES = 64L * 1024 * 1024
+internal const val OUTBOX_CONTROL_QUOTA_BYTES = 64L * 1024
+private const val CONTROL_RECORD_BYTES = 2048
+
+internal class ChunkBudgetExceeded(val reason: ChunkReason) : RuntimeException()
 
 internal enum class ChunkPhase { PLAN, STAGE, SEND, ACK, COMMIT, DONE, PAUSED, BLOCKED }
-internal enum class ChunkReason { NONE, FLAG_OFF, LEGACY_PENDING, INVALID_TIMESTAMP, UNKNOWN_ACCEPTANCE, INVALID_ACK, HTTP_400, HTTP_409, HTTP_413, HTTP_BLOCKED, HTTP_RETRY, IO_FAILURE, CORRUPT_OUTBOX, ENDPOINT_CHANGED, OVERSIZED }
+internal enum class ChunkReason { NONE, FLAG_OFF, LEGACY_PENDING, INVALID_TIMESTAMP, UNKNOWN_ACCEPTANCE, INVALID_ACK, HTTP_400, HTTP_409, HTTP_413, HTTP_BLOCKED, HTTP_RETRY, IO_FAILURE, CORRUPT_OUTBOX, ENDPOINT_CHANGED, OVERSIZED, OUTBOX_QUOTA, MANIFEST_LIMIT, GENERATION_RECORD_LIMIT, GENERATION_CHILD_LIMIT, ENVELOPE_LIMIT }
 internal data class ChunkStatus(val phase: ChunkPhase, val index: Int = 0, val total: Int = 0, val lastAcknowledgedId: String? = null, val batchId: String? = null, val reason: ChunkReason = ChunkReason.NONE)
 internal data class ChunkChild(val index: Int, val batchId: String, val bodySha: String, val count: Int, val acked: Boolean = false, val sentAt: Long? = null, val ackedAt: Long? = null)
 internal data class ChunkManifest(
@@ -104,56 +109,182 @@ internal class ChunkOutbox(
     }
 
     fun stage(manifest: ChunkManifest, plan: ChunkPlan.Ready?) {
-        val dir = generation(manifest.generation)
-        check(!dir.exists())
-        val manifestBytes = encode(manifest).toByteArray(Charsets.UTF_8)
-        val activeBytes = manifest.generation.toByteArray(Charsets.UTF_8)
-        val required = try {
-            (plan?.children ?: emptyList()).fold(STAGE_HEADROOM_BYTES + manifestBytes.size + activeBytes.size) { total, child ->
-                Math.addExact(total, child.body.size.toLong())
+        val bodies = plan?.children?.sumOf { it.body.size.toLong() } ?: 0L
+        val reservation = reserve(manifest, bodies)
+        val attempt = beginReserved(reservation)
+        try {
+            plan?.children?.forEachIndexed { index, child ->
+                stageReservedBody(reservation, index, child.body, child.body.size)
             }
-        } catch (e: ArithmeticException) { throw IOException("STAGE_SIZE_OVERFLOW", e) }
-        val available = try {
-            val directory = generateSequence(root.absoluteFile) { it.parentFile }.firstOrNull { it.isDirectory }
-                ?: throw IOException("FREE_SPACE_UNAVAILABLE")
-            usableSpace(directory)
-        } catch (e: SecurityException) { throw IOException("FREE_SPACE_UNAVAILABLE", e) }
-        if (available < required) throw IOException("INSUFFICIENT_FREE_SPACE")
-        files.directory(root)
-        files.directory(dir)
-        plan?.children?.forEachIndexed { index, child -> files.write(bodyFile(manifest, index), child.body, replace = false) }
-        files.write(File(dir, "manifest.json"), manifestBytes)
-        files.write(File(root, "active"), activeBytes)
+            publishReserved(reservation, manifest)
+        } catch (e: Exception) { rollback(attempt); throw e }
     }
 
     fun save(manifest: ChunkManifest) {
+        val reservation = File(generation(manifest.generation), "reservation")
+        if (reservation.exists()) {
+            val fields = reservation.readLines()
+            check(manifestEncodedBytes(manifest) <= fields[4].toLong())
+            check(retainedBytes() + manifestEncodedBytes(manifest) <= fields[5].toLong())
+        }
         files.write(File(generation(manifest.generation), "manifest.json"), encode(manifest).toByteArray(Charsets.UTF_8))
     }
 
-    fun beginStreaming(generation: String) {
-        val dir = generation(generation)
+    internal data class Reservation(val generation: String, val retained: Long, val bodies: Long,
+        val manifest: Long, val peak: Long, val limit: Long)
+
+    // Payload peak = retained payload + bodies + 3 * manifest bound + 256 reservation bytes.
+    // One immutable publication manifest plus current manifest and its replacement temp coexist.
+    // New bodies have only a temp OR final name. Controls have a separate fixed 64 KiB budget.
+    fun reserve(manifest: ChunkManifest, bodies: Long, limit: Long = OUTBOX_HARD_QUOTA_BYTES): Reservation {
+        generation(manifest.generation)
+        require(bodies >= 0 && limit in 0..OUTBOX_HARD_QUOTA_BYTES)
+        val bound = manifestEncodedBytes(manifest)
+        if (bound > FreshGenerationLimits().manifestBytes) {
+            recordBackpressure(ChunkReason.MANIFEST_LIMIT, manifest.generation, Long.MAX_VALUE, limit)
+            throw ChunkBudgetExceeded(ChunkReason.MANIFEST_LIMIT)
+        }
+        val retained = retainedBytes()
+        val peak = Math.addExact(retained, Math.addExact(bodies, 3 * bound + 256))
+        if (peak > limit) {
+            recordBackpressure(ChunkReason.OUTBOX_QUOTA, manifest.generation, peak, limit)
+            throw ChunkBudgetExceeded(ChunkReason.OUTBOX_QUOTA)
+        }
+        return Reservation(manifest.generation, retained, bodies, bound, peak, limit)
+    }
+
+    fun recordBackpressure(reason: ChunkReason, generation: String, required: Long, limit: Long = OUTBOX_HARD_QUOTA_BYTES) {
+        generation(generation)
+        val file = File(root, "backpressure")
+        if (file.exists()) return
+        if (File(root, "backpressure.tmp").exists()) throw IOException("UNPUBLISHED_BACKPRESSURE")
+        val bytes = listOf("1", reason.name, generation, required.toString(), limit.toString(), retainedBytes().toString(), FreshGenerationLimits().manifestBytes.toString()).joinToString("\n").toByteArray()
+        files.directory(root)
+        try { writeControl(file, bytes, replace = false) }
+        catch (e: Exception) {
+            // A failed first marker write has no committed reference. Do not accumulate temp bytes.
+            if (!file.exists()) { Files.deleteIfExists(File(root, "backpressure.tmp").toPath()); files.sync(root) }
+            throw e
+        }
+    }
+
+    fun backpressure(explicitRetry: Boolean = false, limit: Long = OUTBOX_HARD_QUOTA_BYTES, allowRetry: Boolean = true): ChunkReason? {
+        val file = File(root, "backpressure")
+        if (!file.exists() && File(root, "backpressure.tmp").exists()) return ChunkReason.IO_FAILURE
+        if (!file.exists()) {
+            if (limit == OUTBOX_HARD_QUOTA_BYTES && retainedBytes() > limit - 8192) {
+                if (allowRetry) recordBackpressure(ChunkReason.OUTBOX_QUOTA, "uncollected", retainedBytes() + 8192, limit)
+                return ChunkReason.OUTBOX_QUOTA
+            }
+            return null
+        }
+        val fields = file.readLines()
+        require(fields.size == 7 && fields[0] == "1")
+        val reason = ChunkReason.valueOf(fields[1])
+        val previous = fields[5].toLong()
+        // Only actual release of retained bytes, a changed fixed budget, or explicit retry permits collection.
+        if (explicitRetry || fields[4].toLong() != limit || fields[6].toLong() != FreshGenerationLimits().manifestBytes ||
+            reason == ChunkReason.OUTBOX_QUOTA && fields[3].toLong() - previous <= limit - retainedBytes()) {
+            if (!allowRetry) return reason
+            Files.delete(file.toPath())
+            files.sync(root)
+            return null
+        }
+        return reason
+    }
+
+    fun beginReserved(reservation: Reservation): StagingAttempt {
+        check(reservation.peak <= reservation.limit && retainedBytes() == reservation.retained)
+        check(controlBytes() + 8192 <= OUTBOX_CONTROL_QUOTA_BYTES)
+        preflight(reservation.peak - reservation.retained + STAGE_HEADROOM_BYTES + 8192)
+        val dir = generation(reservation.generation)
+        if (File(root, "active.tmp").exists()) throw IOException("UNPUBLISHED_ACTIVE_POINTER")
         check(!dir.exists())
-        preflight(STAGE_HEADROOM_BYTES)
         files.directory(root)
         files.directory(dir)
+        val attempt = StagingAttempt(this, reservation.generation)
+        try {
+            files.write(File(dir, "reservation"), listOf("1", reservation.generation, reservation.retained,
+                reservation.bodies, reservation.manifest, reservation.peak, reservation.limit).joinToString("\n").toByteArray(), replace = false)
+        } catch (e: Exception) { rollback(attempt); throw e }
+        return attempt
     }
 
-    fun retainedBytes(): Long = if (!root.exists()) 0 else root.walkTopDown().onFail { _, error -> throw error }.filter { it.isFile }
-        .fold(0L) { total, file -> Math.addExact(total, Files.size(file.toPath())) }
-
-    fun stageBody(generation: String, index: Int, bytes: ByteArray, size: Int) {
+    fun stageReservedBody(reservation: Reservation, index: Int, bytes: ByteArray, size: Int) {
         require(index in 0 until 100 && size in 0..524_288 && size <= bytes.size)
+        val dir = generation(reservation.generation)
+        val staged = dir.listFiles()!!.filter { it.name.startsWith("child-") }.sumOf { it.length() }
+        check(staged + size <= reservation.bodies)
         preflight(STAGE_HEADROOM_BYTES + size)
-        files.write(File(generation(generation), "child-$index.json"), bytes, replace = false, size = size)
+        files.write(File(dir, "child-$index.json"), bytes, replace = false, size = size)
     }
 
-    fun publishStreaming(manifest: ChunkManifest) {
+    fun publishReserved(reservation: Reservation, manifest: ChunkManifest) {
+        check(manifest.generation == reservation.generation && manifestEncodedBytes(manifest) <= reservation.manifest)
+        preflight(STAGE_HEADROOM_BYTES + reservation.manifest + reservation.generation.length)
         val bytes = encode(manifest).toByteArray(Charsets.UTF_8)
-        val active = manifest.generation.toByteArray(Charsets.UTF_8)
-        preflight(STAGE_HEADROOM_BYTES + bytes.size + active.size)
         files.write(File(generation(manifest.generation), "manifest.json"), bytes)
-        files.write(File(root, "active"), active)
+        files.write(File(generation(manifest.generation), "published.json"), bytes, replace = false)
+        val active = File(root, "active")
+        val prior = selectedGeneration()
+        if (prior != null) {
+            val priorManifest = File(generation(prior), "manifest.json")
+            val proof = File(root, "active-proof")
+            val previousFile = File(root, "previous")
+            val previous = when {
+                authenticatedPointer(proof) == prior -> proof.readBytes()
+                authenticatedPointer(previousFile) == prior -> previousFile.readBytes()
+                else -> ("1\n" + prior + "\n" + sha256(priorManifest.readBytes()) + "\nlegacy").toByteArray()
+            }
+            writeControl(previousFile, previous)
+        }
+        writeControl(File(root, "active-proof"), ("1\n" + manifest.generation + "\n" + sha256(bytes) + "\npublished").toByteArray())
+        writeControl(active, manifest.generation.toByteArray(Charsets.UTF_8))
     }
+
+    fun rollback(attempt: StagingAttempt) {
+        require(attempt.owner === this)
+        val dir = generation(attempt.generation)
+        // Once published, preserve the complete resumable generation, even if its fsync reported failure.
+        if (File(root, "active").let { it.exists() && it.readText() == attempt.generation }) return
+        val committed = File(dir, "manifest.json")
+        if (committed.exists()) {
+            val manifest = try { decode(committed.readText()) } catch (_: Exception) { return }
+            if (manifest.generation != attempt.generation || manifest.phase !in setOf(ChunkPhase.STAGE, ChunkPhase.BLOCKED) ||
+                manifest.children.any { it.acked || it.sentAt != null } || manifest.reason == ChunkReason.UNKNOWN_ACCEPTANCE) return
+        }
+        val allowed = Regex("child-[0-9]+\\.json(\\.tmp)?|(manifest|published)\\.json(\\.tmp)?|reservation(\\.tmp)?")
+        val entries = dir.listFiles() ?: return
+        if (entries.any { !it.isFile || !allowed.matches(it.name) }) return
+        val proof = File(root, "active-proof")
+        if (proof.isFile && proof.readLines().getOrNull(1) == attempt.generation) {
+            val previous = File(root, "previous")
+            if (previous.exists()) Files.move(previous.toPath(), proof.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            else Files.deleteIfExists(proof.toPath())
+            files.sync(root)
+        }
+        entries.forEach { Files.deleteIfExists(it.toPath()); files.sync(dir) }
+        Files.deleteIfExists(dir.toPath())
+        File(root, "active.tmp").let { if (it.exists() && it.readText() == attempt.generation) Files.delete(it.toPath()) }
+        files.sync(root)
+    }
+
+    internal class StagingAttempt internal constructor(internal val owner: ChunkOutbox, internal val generation: String)
+
+    private fun isControl(file: File): Boolean = file.parentFile == root &&
+        (file.name.removeSuffix(".tmp") in setOf("active", "active-proof", "previous", "backpressure") ||
+            file.name.matches(Regex("receipt-[a-zA-Z0-9-]{1,100}\\.json(\\.tmp)?")))
+
+    fun controlBytes(): Long = if (!root.exists()) 0 else root.listFiles()!!.filter { it.isFile && isControl(it) }.sumOf { it.length() }
+
+    private fun writeControl(file: File, bytes: ByteArray, replace: Boolean = true) {
+        require(isControl(file) && bytes.size <= CONTROL_RECORD_BYTES)
+        if (controlBytes() + bytes.size > OUTBOX_CONTROL_QUOTA_BYTES) throw IOException("CONTROL_BUDGET")
+        files.write(file, bytes, replace)
+    }
+
+    fun retainedBytes(): Long = if (!root.exists()) 0 else root.walkTopDown().onFail { _, error -> throw error }.filter { it.isFile && !isControl(it) }
+        .fold(0L) { total, file -> Math.addExact(total, Files.size(file.toPath())) }
 
     private fun preflight(required: Long) {
         val directory = generateSequence(root.absoluteFile) { it.parentFile }.firstOrNull { it.isDirectory }
@@ -163,10 +294,41 @@ internal class ChunkOutbox(
         if (available < required) throw IOException("INSUFFICIENT_FREE_SPACE")
     }
 
-    fun load(): ChunkManifest? {
+    private fun authenticatedPointer(record: File): String? {
+        if (!record.isFile || record.length() > CONTROL_RECORD_BYTES) return null
+        return try {
+            val fields = record.readLines()
+            require(fields.size == 4 && fields[0] == "1")
+            val dir = generation(fields[1])
+            val publication = File(dir, if (fields[3] == "published") "published.json" else "manifest.json")
+            require(publication.isFile && publication.length() <= FreshGenerationLimits().manifestBytes)
+            val bytes = publication.readBytes()
+            require(sha256(bytes) == fields[2])
+            val initial = decode(bytes.toString(Charsets.UTF_8))
+            val current = decode(File(dir, "manifest.json").readText())
+            require(initial.generation == current.generation && initial.fingerprint == current.fingerprint)
+            require(initial.recordIds == current.recordIds && initial.recordHashes == current.recordHashes && initial.targets == current.targets)
+            require(initial.children.map { listOf(it.index, it.batchId, it.bodySha, it.count) } ==
+                current.children.map { listOf(it.index, it.batchId, it.bodySha, it.count) })
+            fields[1]
+        } catch (_: Exception) { null }
+    }
+
+    private fun selectedGeneration(): String? {
         val active = File(root, "active")
+        val proof = File(root, "active-proof")
+        if (!proof.exists()) return if (active.exists()) active.readText(Charsets.UTF_8) else null
+        val selected = authenticatedPointer(proof)
+        if (active.isFile && active.length() <= 100 && active.readText() == selected) return selected
+        val previous = authenticatedPointer(File(root, "previous"))
+        if (previous != null) return previous
         if (!active.exists()) return null
-        val dir = generation(active.readText(Charsets.UTF_8))
+        error("NO_VALID_ACTIVE_POINTER")
+    }
+
+    fun load(): ChunkManifest? {
+        val selected = selectedGeneration() ?: return null
+        val dir = generation(selected)
         val manifest = decode(File(dir, "manifest.json").readText(Charsets.UTF_8))
         require(dir.name == manifest.generation)
         require(manifest.fingerprint == parentFingerprint(manifest.endpointHash, manifest.recordIds, manifest.recordHashes, manifest.targets))
@@ -185,7 +347,7 @@ internal class ChunkOutbox(
             ChunkPhase.PLAN -> error("UNPUBLISHED_PLAN")
             else -> Unit
         }
-        if (manifest.phase != ChunkPhase.BLOCKED || manifest.reason !in setOf(ChunkReason.OVERSIZED, ChunkReason.INVALID_TIMESTAMP)) {
+        if (manifest.phase != ChunkPhase.BLOCKED || manifest.reason !in setOf(ChunkReason.OVERSIZED, ChunkReason.INVALID_TIMESTAMP, ChunkReason.GENERATION_RECORD_LIMIT, ChunkReason.GENERATION_CHILD_LIMIT, ChunkReason.MANIFEST_LIMIT, ChunkReason.ENVELOPE_LIMIT)) {
             require(manifest.children.isNotEmpty())
             require(manifest.children.sumOf { it.count } == manifest.recordIds.size)
         }
@@ -211,12 +373,12 @@ internal class ChunkOutbox(
         files.sync(generation(manifest.generation))
     }
 
-    fun status(): ChunkStatus? = try { load()?.status() }
+    fun status(): ChunkStatus? = try { backpressure(allowRetry = false)?.let { ChunkStatus(ChunkPhase.BLOCKED, reason = it) } ?: load()?.status() }
         catch (_: IOException) { ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE) }
         catch (_: Exception) { ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.CORRUPT_OUTBOX) }
 
     private fun encode(m: ChunkManifest): String {
-        require(manifestEncodedBytes(m) <= FreshGenerationLimits().manifestBytes) { "MANIFEST_BYTE_BUDGET" }
+        if (manifestEncodedBytes(m) > FreshGenerationLimits().manifestBytes) throw ChunkBudgetExceeded(ChunkReason.MANIFEST_LIMIT)
         return JSONObject().apply {
             put("formatVersion", 1)
             put("generation", m.generation)

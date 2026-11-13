@@ -53,10 +53,14 @@ internal class ChunkSync(
                 return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE)
             }
         } else {
+            try { outbox.backpressure()?.let { return ChunkStatus(ChunkPhase.BLOCKED, reason = it) } }
+            catch (_: Exception) { return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE) }
             val input = collect()
             if (input.producer != null) {
                 manifest = try {
                     StreamingChunkPlanner(outbox, mapping, limits, newId, clock).stage(input, endpointHash)
+                } catch (e: ChunkBudgetExceeded) {
+                    return ChunkStatus(ChunkPhase.BLOCKED, reason = e.reason)
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     throw e
                 } catch (_: Exception) {
@@ -81,9 +85,11 @@ internal class ChunkSync(
                         null -> ChunkReason.NONE
                         ChunkBlockCause.OVERSIZED -> ChunkReason.OVERSIZED
                         ChunkBlockCause.INVALID_TIMESTAMP -> ChunkReason.INVALID_TIMESTAMP
+                        ChunkBlockCause.ENVELOPE_LIMIT -> ChunkReason.ENVELOPE_LIMIT
                     }, blocked?.recordId, blocked?.wireBytes, blocked?.mappedBytes)
-                require(manifestEncodedBytes(manifest) <= FreshGenerationLimits().manifestBytes) { "MANIFEST_BYTE_BUDGET" }
-                try { outbox.stage(manifest, plan as? ChunkPlan.Ready) } catch (_: Exception) {
+                try { outbox.stage(manifest, plan as? ChunkPlan.Ready) } catch (e: ChunkBudgetExceeded) {
+                    return ChunkStatus(ChunkPhase.BLOCKED, reason = e.reason)
+                } catch (_: Exception) {
                     return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE)
                 }
                 if (blocked != null) return manifest.status()

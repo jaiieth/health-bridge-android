@@ -38,14 +38,14 @@ class ManifestByteBudgetTest {
             val record = ChunkRecord(id, "{\"recordId\":" + JSONObject.quote(id) + "}")
             val result = stage(root, input(record, 1000))
             assertEquals(ChunkPhase.BLOCKED, result.phase)
-            assertEquals(ChunkReason.OVERSIZED, result.reason)
+            assertEquals(ChunkReason.MANIFEST_LIMIT, result.reason)
             assertTrue(result.recordIds.isNotEmpty())
             assertTrue(result.children.isEmpty())
             assertFalse(File(root, "${result.generation}/manifest.json").exists())
             if (active) assertEquals("older-generation", File(root, "active").readText())
             else assertFalse(File(root, "active").exists())
-            val bodies = File(root, result.generation).listFiles()!!.filter { it.name.startsWith("child-") }
-            assertTrue(bodies.isNotEmpty())
+            val bodies = (File(root, result.generation).listFiles() ?: emptyArray()).filter { it.name.startsWith("child-") }
+            assertTrue(bodies.isEmpty())
             bodies.forEach { body ->
                 val records = JSONObject(body.readText()).getJSONArray("records")
                 repeat(records.length()) { assertEquals(id, records.getJSONObject(it).getString("recordId")) }
@@ -87,7 +87,8 @@ class ManifestByteBudgetTest {
         val manifest = stage(root, input(record, 3), FreshGenerationLimits(queueBytes = older.length() + body.size), count = 1)
         assertEquals(ChunkPhase.BLOCKED, manifest.phase)
         assertEquals("retain", older.readText())
-        assertArrayEquals(body, File(root, "${manifest.generation}/child-0.json").readBytes())
+        assertEquals(ChunkReason.OUTBOX_QUOTA, manifest.reason)
+        assertFalse(File(root, manifest.generation).exists())
         assertFalse(File(root, "${manifest.generation}/child-1.json").exists())
         assertFalse(File(root, "active").exists())
         assertFalse(File(root, "${manifest.generation}/manifest.json").exists())
@@ -106,6 +107,6 @@ class ManifestByteBudgetTest {
         assertEquals(ChunkPhase.BLOCKED, status.phase)
         assertEquals(0, cursors.commits)
         assertFalse(File(root, "active").exists())
-        assertTrue(root.walkTopDown().any { it.name == "child-0.json" })
+        assertFalse(root.walkTopDown().any { it.name == "child-0.json" })
     }
 }

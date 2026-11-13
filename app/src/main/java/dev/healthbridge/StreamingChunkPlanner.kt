@@ -67,9 +67,12 @@ internal class StreamingRetention {
  * Manifest encoding is guarded before allocating JSON objects or encoded text at
  * <=8388608 UTF-8 bytes. Raw ID/hash content is <=16564224 UTF-16 bytes by default;
  * escaped strings and JSON overhead are counted separately before insertion.
- * Child body staging enforces a cumulative outbox quota of <=67108864 bytes,
- * including files retained from older generations, before each body write.
- * Refusal never deletes evidence or commits cursors. These are enforced content
+ * A read-only planning pass counts bodies and manifest metadata before admission.
+ * Replay verifies child hashes and the complete manifest before publication, retaining
+ * the same bounded payload buffer. Source changes fail closed. Reservation includes
+ * all retained files, body bytes, two bounded manifests, two pointer copies and
+ * 1024 bytes for reservation/marker metadata. It stays fixed across resume.
+ * Refusal never deletes previously retained evidence or commits cursors. These are enforced content
  * bounds, not JVM heap/RSS or allocator claims.
  * SDK record graphs/pages, page tokens and sourceName lookup allocations are outside
  * this app-owned serialization/planning bound and remain explicitly unverified.
@@ -86,16 +89,59 @@ internal class StreamingChunkPlanner(
     private class Refused(val blocked: ChunkPlan.Blocked) : RuntimeException()
 
     suspend fun stage(input: FreshChunkInput, endpointHash: String): ChunkManifest {
+        outbox.backpressure(limit = generationLimits.queueBytes)?.let { throw ChunkBudgetExceeded(it) }
+        val generation = newId()
+        val ids = mutableListOf<String>()
+        val now = clock()
+        val planned = build(input, endpointHash, generation, now, { newId().also(ids::add) })
+        val manifest = planned.first
+        if (manifest.reason == ChunkReason.MANIFEST_LIMIT) {
+            outbox.recordBackpressure(manifest.reason, generation, Long.MAX_VALUE)
+            return manifest
+        }
+        val reservation = try {
+            outbox.reserve(manifest, planned.second, generationLimits.queueBytes)
+        } catch (e: ChunkBudgetExceeded) {
+            return manifest.copy(phase = ChunkPhase.BLOCKED, children = emptyList(), reason = e.reason)
+        }
+        val attempt = outbox.beginReserved(reservation)
+        try {
+            if (manifest.phase != ChunkPhase.BLOCKED) {
+                var idIndex = 0
+                val replay = build(input, endpointHash, generation, now, { ids[idIndex++] }, manifest) { index, bytes, size ->
+                    val child = manifest.children.getOrNull(index) ?: error("SOURCE_CHANGED")
+                    val hash = MessageDigest.getInstance("SHA-256").apply { update(bytes, 0, size) }.digest()
+                        .joinToString("") { "%02x".format(it.toInt() and 255) }
+                    check(child.bodySha == hash) { "SOURCE_CHANGED" }
+                    outbox.stageReservedBody(reservation, index, bytes, size)
+                }
+                check(replay.first == manifest && replay.second == planned.second) { "SOURCE_CHANGED" }
+            }
+            outbox.publishReserved(reservation, manifest)
+            return manifest
+        } catch (e: Exception) {
+            outbox.rollback(attempt)
+            throw e
+        }
+    }
+
+    private suspend fun build(
+        input: FreshChunkInput, endpointHash: String, generation: String, now: Long,
+        childId: () -> String,
+        expected: ChunkManifest? = null,
+        write: (Int, ByteArray, Int) -> Unit = { _, _, _ -> },
+    ): Pair<ChunkManifest, Long> {
         require(input.records.isEmpty()) { "STREAM_WITH_LIST" }
         val producer = checkNotNull(input.producer)
         require(limits.wireBytes <= FRESH_RECORD_BYTES && limits.count <= 5000 && limits.mappedBytes <= 900_000)
         require(input.targetCursors.size <= 6 && input.targetCursors.keys.all { it in freshTypeNames })
         input.targetCursors.values.forEach { require(it.length <= 40); Instant.parse(it) }
         val targets = input.targetCursors.toSortedMap()
-        val generation = newId()
-        outbox.beginStreaming(generation)
-        val recordIds = mutableListOf<String>()
-        val recordHashes = mutableListOf<String>()
+        val collectedIds = if (expected == null) mutableListOf<String>() else null
+        val collectedHashes = if (expected == null) mutableListOf<String>() else null
+        val recordIds = expected?.recordIds ?: checkNotNull(collectedIds)
+        val recordHashes = expected?.recordHashes ?: checkNotNull(collectedHashes)
+        var seen = 0
         val children = mutableListOf<ChunkChild>()
         val usedIds = mutableSetOf<String>()
         val buffer = ByteArray(limits.wireBytes.toInt())
@@ -105,15 +151,16 @@ internal class StreamingChunkPlanner(
         var mapped = 2L
         var metadataUtf16Bytes = 0L
         var manifestBound = manifestBaseBytes(generation, endpointHash, targets) + generationLimits.children * 1024L
-        var queueBytes = outbox.retainedBytes()
+        var bodyBytes = 0L
         var publish = true
+        var limitReason: ChunkReason? = null
         val hashPlaceholder = "0".repeat(64)
 
         fun refuse(record: ChunkRecord?, wire: Long, mappedBytes: Long?, cause: ChunkBlockCause = ChunkBlockCause.OVERSIZED): Nothing {
             throw Refused(ChunkPlan.Blocked(record?.recordId?.takeIf { it.length <= FRESH_RECORD_BYTES }, wire, mappedBytes, if (record == null) 0 else 1, cause))
         }
         fun startChild() {
-            batchId = newId()
+            batchId = childId()
             require(receiverBatchId.matches(batchId) && usedIds.add(batchId)) { "INVALID_BATCH_ID" }
             val prefix = ChunkPartitioner.prefix(batchId).toByteArray(Charsets.UTF_8)
             if (prefix.size <= buffer.size) prefix.copyInto(buffer)
@@ -122,17 +169,13 @@ internal class StreamingChunkPlanner(
             mapped = 2
         }
         fun stageChild() {
-            if (size + 2L > limits.wireBytes || mapped > limits.mappedBytes) refuse(null, size + 2L, mapped)
-            if (size + 2L > generationLimits.queueBytes - queueBytes) {
-                publish = false
-                refuse(null, size + 2L, mapped)
-            }
+            if (size + 2L > limits.wireBytes || mapped > limits.mappedBytes) refuse(null, size + 2L, mapped, ChunkBlockCause.ENVELOPE_LIMIT)
             buffer[size++] = ']'.code.toByte()
             buffer[size++] = '}'.code.toByte()
             val digest = MessageDigest.getInstance("SHA-256").apply { update(buffer, 0, size) }.digest()
             val hash = digest.joinToString("") { "%02x".format(it.toInt() and 255) }
-            outbox.stageBody(generation, children.size, buffer, size)
-            queueBytes += size
+            write(children.size, buffer, size)
+            bodyBytes += size
             children += ChunkChild(children.size, batchId, hash, count)
             retention.childCount = children.size
         }
@@ -152,17 +195,22 @@ internal class StreamingChunkPlanner(
                     refuse(record, wireSize, null)
                 }
                 val metadataBytes = 2L * (record.recordId.length + 64L)
-                if (recordIds.size == generationLimits.records || metadataBytes > generationLimits.metadataUtf16Bytes - metadataUtf16Bytes) {
+                if (seen == generationLimits.records || metadataBytes > generationLimits.metadataUtf16Bytes - metadataUtf16Bytes) {
+                    limitReason = ChunkReason.GENERATION_RECORD_LIMIT
                     refuse(record, wireSize, null)
                 }
                 val encoded = record.json.toByteArray(Charsets.UTF_8)
                 retention.sample(buffer.size, count, record, encoded.size)
-                recordIds += record.recordId
-                recordHashes += sha256(encoded)
+                val recordHash = sha256(encoded)
+                if (expected == null) {
+                    checkNotNull(collectedIds).add(record.recordId)
+                    checkNotNull(collectedHashes).add(recordHash)
+                } else check(recordIds.getOrNull(seen) == record.recordId && recordHashes.getOrNull(seen) == recordHash) { "SOURCE_CHANGED" }
+                seen++
                 manifestBound += contribution
                 metadataUtf16Bytes += metadataBytes
                 retention.metadataUtf16Bytes = metadataUtf16Bytes
-                retention.recordCount = recordIds.size
+                retention.recordCount = seen
                 val mappedSize = try {
                     // Identity preserves custom timestamp contracts on injected mapping instances.
                     if (mapping === ChunkContracts.verifiedMapping) productionMappedRecordBytes(record)
@@ -173,7 +221,10 @@ internal class StreamingChunkPlanner(
                 val comma = if (count == 0) 0 else 1
                 if (count + 1 > limits.count || size + 2L + encoded.size + comma > limits.wireBytes || mapped + mappedSize + comma > limits.mappedBytes) {
                     if (count == 0) refuse(record, size + 2L + encoded.size, 2 + mappedSize)
-                    if (children.size + 1 == generationLimits.children) refuse(record, wireSize, 2 + mappedSize)
+                    if (children.size + 1 == generationLimits.children) {
+                        limitReason = ChunkReason.GENERATION_CHILD_LIMIT
+                        refuse(record, wireSize, 2 + mappedSize)
+                    }
                     stageChild()
                     startChild()
                     if (size + 2L + encoded.size > limits.wireBytes || 2 + mappedSize > limits.mappedBytes) {
@@ -187,27 +238,26 @@ internal class StreamingChunkPlanner(
                 mapped += mappedSize + if (count == 1) 0 else 1
                 retention.sample(buffer.size, count, null, 0)
             }
+            if (expected != null) check(seen == expected.recordIds.size) { "SOURCE_CHANGED" }
             stageChild()
         } catch (e: Refused) {
             blocked = e.blocked
         } catch (e: OversizedFreshRecord) {
             blocked = ChunkPlan.Blocked(e.recordId?.takeIf { it.length <= FRESH_RECORD_BYTES }, e.wireBytes, null, 1)
         }
-        val now = clock()
         val manifest = ChunkManifest(generation, parentFingerprint(endpointHash, recordIds, recordHashes, targets), endpointHash,
             recordIds, recordHashes, targets, now, now, if (blocked == null) ChunkPhase.STAGE else ChunkPhase.BLOCKED,
-            if (blocked == null) children else emptyList(), when (blocked?.cause) {
+            if (blocked == null) children else emptyList(), limitReason ?: when (blocked?.cause) {
                 null -> ChunkReason.NONE
                 ChunkBlockCause.OVERSIZED -> ChunkReason.OVERSIZED
                 ChunkBlockCause.INVALID_TIMESTAMP -> ChunkReason.INVALID_TIMESTAMP
+                ChunkBlockCause.ENVELOPE_LIMIT -> ChunkReason.ENVELOPE_LIMIT
             }, blocked?.recordId, blocked?.wireBytes, blocked?.mappedBytes)
         val encodedBound = manifestEncodedBytes(manifest)
-        if (!publish || encodedBound > generationLimits.manifestBytes ||
-            encodedBound + generation.length > generationLimits.queueBytes - queueBytes) {
-            return manifest.copy(phase = ChunkPhase.BLOCKED, children = emptyList(), reason = ChunkReason.OVERSIZED)
+        if (!publish || encodedBound > generationLimits.manifestBytes) {
+            return manifest.copy(phase = ChunkPhase.BLOCKED, children = emptyList(), reason = ChunkReason.MANIFEST_LIMIT) to 0L
         }
-        outbox.publishStreaming(manifest)
-        return manifest
+        return manifest to if (blocked == null) bodyBytes else 0L
     }
 }
 

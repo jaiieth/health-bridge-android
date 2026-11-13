@@ -68,7 +68,8 @@ class ChunkIoFailureTest {
             assertEquals(label, ChunkReason.IO_FAILURE, status.reason)
             assertNotNull(label, failedFiles)
             assertEquals(label, 0, writesAfterFailure)
-            assertEquals(label, failedFiles, snapshot(h.root))
+            if (h.outbox.load() == null) assertTrue(label, snapshot(h.root).isEmpty())
+            else assertEquals(label, failedFiles, snapshot(h.root))
             if (!published) assertTrue(label, failedFiles!!.keys.any { it.endsWith("${write.name}.tmp") })
             val expectedSends = when (write.phase) {
                 ChunkPhase.SEND, ChunkPhase.ACK -> write.acked
@@ -269,16 +270,13 @@ class ChunkIoFailureTest {
         val source = staged()
         val manifest = source.outbox.load()!!
         val plan = ChunkPartitioner.partition(source.input.records, manifest.children.map { it.batchId }, syntheticMapping, source.limits) as ChunkPlan.Ready
-        val manifestSize = File(source.root, "${manifest.generation}/manifest.json").length()
-        val required = plan.children.sumOf { it.body.size.toLong() } + manifestSize +
-            manifest.generation.toByteArray(Charsets.UTF_8).size + 1_048_576L
+        val required = plan.children.sumOf { it.body.size.toLong() } + 3 * manifestEncodedBytes(manifest) + 256 + STAGE_HEADROOM_BYTES + 8192
         listOf(required - 1, required).forEach { available ->
             val root = temporary.newFolder()
             val old = File(root, "older")
             assertTrue(old.mkdir())
             File(old, "child-0.json").writeText("retained body")
             File(old, "manifest.json.tmp").writeText("retained failed temp")
-            File(root, "active").writeText("older")
             val before = snapshot(root)
             var writes = 0
             var syncs = 0
@@ -286,7 +284,7 @@ class ChunkIoFailureTest {
             val outbox = ChunkOutbox(root, DurableFiles(syncDirectory = { syncs++ }, fault = { _, _ -> writes++ }), usableSpace = { directory ->
                 probes++
                 assertEquals(root, directory)
-                assertEquals(before, snapshot(root))
+                if (probes == 1) assertEquals(before, snapshot(root))
                 available
             })
             if (available < required) {
@@ -301,7 +299,7 @@ class ChunkIoFailureTest {
                 before.filterKeys { it != "active" }.forEach { (path, bytes) -> assertEquals(bytes, File(root, path).readBytes().toList()) }
                 plan.children.forEachIndexed { i, child -> assertArrayEquals(child.body, outbox.body(manifest, i)) }
             }
-            assertEquals(1, probes)
+            assertEquals(if (available < required) 1 else 4, probes)
         }
     }
 

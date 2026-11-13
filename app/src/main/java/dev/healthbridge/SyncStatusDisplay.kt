@@ -66,6 +66,11 @@ object SyncStatusDisplay {
         ChunkReason.IO_FAILURE -> "Local storage failed. Recorded counts may be unavailable."
         ChunkReason.CORRUPT_OUTBOX -> "The retained outbox could not be read safely."
         ChunkReason.ENDPOINT_CHANGED -> "The endpoint differs from the retained batch destination."
+        ChunkReason.OUTBOX_QUOTA -> "The fresh-sync outbox has reached its storage admission limit."
+        ChunkReason.MANIFEST_LIMIT -> "The sync window exceeds the manifest metadata budget."
+        ChunkReason.GENERATION_RECORD_LIMIT -> "The sync window exceeds the generation record limit."
+        ChunkReason.GENERATION_CHILD_LIMIT -> "The sync window exceeds the generation chunk limit."
+        ChunkReason.ENVELOPE_LIMIT -> "The delivery envelope exceeds the configured size limit."
         ChunkReason.OVERSIZED -> "A record exceeds the delivery size limit."
     }
 

@@ -46,7 +46,7 @@ class ChunkStreamingTest {
             produceFreshPages(readPage = { token ->
                 assertFalse(insideAccept)
                 val index = token?.toInt() ?: 0
-                assertEquals(emitted, index)
+                assertEquals(emitted % pages, index)
                 requests++
                 FreshPage(listOf(record(index)), if (index + 1 < pages) (index + 1).toString() else null)
             }, accept = { record ->
@@ -60,8 +60,8 @@ class ChunkStreamingTest {
         }
         val manifest = stage(outbox, input, retention = retention)
         assertEquals(ChunkPhase.STAGE, manifest.phase)
-        assertEquals(pages, requests)
-        assertEquals(pages, emitted)
+        assertEquals(pages * 2, requests)
+        assertEquals(pages * 2, emitted)
         assertEquals(pages, retention.recordCount)
         assertEquals(1, retention.peakIncomingRecords)
         assertTrue(retention.peakRecords in 2..5001)
@@ -147,7 +147,7 @@ class ChunkStreamingTest {
                 val outbox = ChunkOutbox(root())
                 val expected = ChunkPartitioner.partition(records, listOf("stream-1"), ProductionReceiverMapping(), limits) as ChunkPlan.Blocked
                 val actual = stage(outbox, input(records), limits)
-                assertEquals(ChunkReason.OVERSIZED, actual.reason)
+                assertEquals(if (records.isEmpty()) ChunkReason.ENVELOPE_LIMIT else ChunkReason.OVERSIZED, actual.reason)
                 assertEquals(expected.recordId, actual.blockedRecordId)
                 assertEquals(expected.wireBytes, actual.blockedWireBytes)
                 assertEquals(expected.mappedBytes, actual.blockedMappedBytes)
@@ -253,8 +253,7 @@ class ChunkStreamingTest {
         assertEquals(ChunkPhase.BLOCKED, manifest.phase)
         assertTrue(manifest.children.isEmpty())
         assertEquals(0, cursors.commits)
-        assertEquals(listOf("child-0.json"), File(folder, manifest.generation).listFiles()!!.filter { it.name.startsWith("child-") }.map { it.name })
-        assertArrayEquals(ChunkPartitioner.envelope("id-1", listOf(record(0))), File(folder, "${manifest.generation}/child-0.json").readBytes())
+        assertTrue(File(folder, manifest.generation).listFiles()!!.none { it.name.startsWith("child-") })
         val before = snapshot(folder)
         assertEquals(ChunkReason.OVERSIZED, runBlocking { runner.run(true, "synthetic", ChunkContracts.verifiedMapping) { error("No recollection") } }.reason)
         assertEquals(before, snapshot(folder))
@@ -267,7 +266,7 @@ class ChunkStreamingTest {
             val outbox = ChunkOutbox(root())
             val retention = StreamingRetention()
             val manifest = stage(outbox, input(records), budget = budget, retention = retention)
-            assertEquals(ChunkReason.OVERSIZED, manifest.reason)
+            assertEquals(ChunkReason.GENERATION_RECORD_LIMIT, manifest.reason)
             assertEquals(ChunkPhase.BLOCKED, manifest.phase)
             assertEquals("r2", manifest.blockedRecordId)
             assertEquals(listOf("r0", "r1"), manifest.recordIds)
@@ -287,7 +286,7 @@ class ChunkStreamingTest {
         assertEquals(100, stage(full, input { accept -> repeat(100) { accept(record(it)) } }, ChunkLimits(count = 1)).children.size)
         val overflow = ChunkOutbox(root())
         val refused = stage(overflow, input { accept -> repeat(101) { accept(record(it)) } }, ChunkLimits(count = 1))
-        assertEquals(ChunkReason.OVERSIZED, refused.reason)
+        assertEquals(ChunkReason.GENERATION_CHILD_LIMIT, refused.reason)
         assertEquals("r100", refused.blockedRecordId)
         assertTrue(refused.children.isEmpty())
         assertEquals(ChunkPhase.BLOCKED, overflow.load()!!.phase)
@@ -305,7 +304,7 @@ class ChunkStreamingTest {
         } }
         assertEquals(100_000, accepted)
         assertEquals(ChunkPhase.BLOCKED, status.phase)
-        assertEquals(ChunkReason.OVERSIZED, status.reason)
+        assertEquals(ChunkReason.GENERATION_RECORD_LIMIT, status.reason)
         assertEquals(0, status.total)
         val manifest = outbox.load()!!
         assertEquals(100_000, manifest.recordIds.size)
@@ -326,7 +325,7 @@ class ChunkStreamingTest {
         assertEquals(16_547_840L, retention.metadataUtf16Bytes)
         assertEquals(1010, retention.recordCount)
         assertEquals(1010, manifest.recordHashes.size)
-        assertEquals(ChunkReason.OVERSIZED, manifest.reason)
+        assertEquals(ChunkReason.MANIFEST_LIMIT, manifest.reason)
         assertTrue(manifest.children.isEmpty())
         assertNull(outbox.load())
     }
@@ -343,7 +342,7 @@ class ChunkStreamingTest {
             } }
             assertNull(outbox.load())
             assertFalse(File(folder, "active").exists())
-            if (childId == "duplicate") assertTrue(File(folder, "generation/child-0.json").exists())
+            assertFalse(File(folder, "generation/child-0.json").exists())
         }
     }
 
@@ -410,7 +409,9 @@ class ChunkStreamingTest {
                 assertEquals("$name $boundary", ChunkReason.IO_FAILURE, status.reason)
                 assertNotNull(failed)
                 assertEquals(0, writesAfter)
-                assertEquals(failed, snapshot(folder))
+                if (name == "active" && boundary in listOf(DurableBoundary.RENAMED, DurableBoundary.DIRECTORY_SYNCED)) {
+                    assertEquals(failed, snapshot(folder))
+                } else assertTrue(snapshot(folder).isEmpty())
                 assertEquals(0, cursors.commits)
             }
         }
@@ -424,7 +425,7 @@ class ChunkStreamingTest {
             assertThrows(IOException::class.java) { stage(outbox, input(listOf(record(0)))) }
             assertEquals(failureAt + 1, probes)
             assertNull(outbox.load())
-            assertEquals(if (failureAt == 2) 1 else 0, folder.walkTopDown().count { it.name == "child-0.json" })
+            assertEquals(0, folder.walkTopDown().count { it.name == "child-0.json" })
         }
     }
 
