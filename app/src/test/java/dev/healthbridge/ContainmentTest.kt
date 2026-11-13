@@ -32,16 +32,10 @@ class ContainmentTest {
 
     @Test fun offReplacesStaleStatusBeforeEndpointOrPendingReads() = runBlocking {
         val store = SentinelStore()
-        Containment.run(store, settings(invalid = true), false) { _, _, _, _ -> error("send") }
+        Containment.run(store, settings(invalid = true), false, { error("collect") }) { _, _, _, _ -> error("send") }
         assertEquals("Sync OFF", store.saved.result)
         assertEquals("yesterday", store.saved.lastSuccess)
         assertEquals(listOf("Sync OFF"), store.events)
-    }
-
-    @Test fun enabledHealthRemainsPausedWithoutReadingCredentialsOrRows() = runBlocking {
-        val store = SentinelStore()
-        Containment.run(store, settings(true, true), false) { _, _, _, _ -> error("send") }
-        assertEquals("Health sync PAUSED: containment stage", store.saved.result)
     }
 
     @Test fun classification() {
@@ -61,7 +55,7 @@ class ContainmentTest {
         val batch = EmptyTest("123e4567-e89b-12d3-a456-426614174000")
         val expected = "{\"schemaVersion\":1,\"batchId\":\"123e4567-e89b-12d3-a456-426614174000\",\"records\":[]}"
         assertArrayEquals(expected.toByteArray(), batch.body)
-        Containment.run(store, settings(), true) { endpoint, token, _, marker ->
+        Containment.run(store, settings(), true, { error("collect") }) { endpoint, token, _, marker ->
             Transport.sendEmpty(endpoint, token, batch, marker) { request ->
                 val buffer = Buffer()
                 request.body!!.writeTo(buffer)
@@ -93,11 +87,11 @@ class ContainmentTest {
         listOf("http://invalid", "https://example.com").forEach { endpoint ->
             val store = SentinelStore()
             var executions = 0
-            Containment.run(store, settings(), true) { _, token, batch, marker ->
+            Containment.run(store, settings(true), true, { error("collect") }) { _, token, batch, marker ->
                 Transport.sendEmpty(endpoint, token, batch, marker) { error("Call construction failed") }
             }
             assertEquals(listOf("Empty webhook test: RETRY; request not sent; no automatic retry"), store.events)
-            Containment.run(store, settings(), true) { _, _, _, marker -> marker(); executions++; 200 }
+            Containment.run(store, settings(true), true, { error("collect") }) { _, _, _, marker -> marker(); executions++; 200 }
             assertEquals(1, executions)
             assertTrue(store.saved.result.contains("ACCEPTED"))
         }
@@ -108,7 +102,7 @@ class ContainmentTest {
             val store = SentinelStore()
             val original = store.legacy.copy(body = store.legacy.body.copyOf())
             var sends = 0
-            Containment.run(store, settings(), true) { _, _, _, marker -> marker(); sends++; code }
+            Containment.run(store, settings(true), true, { error("collect") }) { _, _, _, marker -> marker(); sends++; code }
             assertTrue(currentCoroutineContext().isActive)
             assertEquals("Empty webhook test: BLOCKED HTTP $code; one shot, no automatic retry", store.status().result)
             assertEquals(1, sends)
@@ -125,7 +119,7 @@ class ContainmentTest {
         listOf(0, 408, 425, 429, 503).forEach { code ->
             val store = SentinelStore()
             var sends = 0
-            Containment.run(store, settings(), true) { _, _, _, marker -> marker(); sends++; code }
+            Containment.run(store, settings(true), true, { error("collect") }) { _, _, _, marker -> marker(); sends++; code }
             assertEquals(1, sends)
             assertEquals("Empty webhook test: RETRY HTTP $code; one shot, no automatic retry", store.saved.result)
         }
@@ -133,7 +127,7 @@ class ContainmentTest {
 
     @Test fun failureAfterSendEntryRetainsDurableUnknown() = runBlocking {
         val store = SentinelStore()
-        Containment.run(store, settings(), true) { endpoint, token, batch, marker ->
+        Containment.run(store, settings(true), true, { error("collect") }) { endpoint, token, batch, marker ->
             Transport.sendEmpty(endpoint, token, batch, marker) {
                 val execute: () -> Int = { error("Interrupted after entry") }
                 execute
@@ -151,7 +145,7 @@ class ContainmentTest {
             }
         }
         var executed = false
-        Containment.run(store, settings(), true) { endpoint, token, batch, marker ->
+        Containment.run(store, settings(true), true, { error("collect") }) { endpoint, token, batch, marker ->
             Transport.sendEmpty(endpoint, token, batch, marker) {
                 val execute: () -> Int = { executed = true; 200 }
                 execute

@@ -42,10 +42,13 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
     override suspend fun doWork(): Result =
         withContext(Dispatchers.IO) {
             AppState.mutex.withLock {
+                val store = AppState.store(applicationContext)
+                val settings = Settings(applicationContext)
                 Containment.run(
-                    AppState.store(applicationContext),
-                    Settings(applicationContext),
+                    store,
+                    settings,
                     inputData.getBoolean("test", false),
+                    freshSync = { runFreshChunkSync(applicationContext, store, settings) },
                 ) { endpoint, token, batch, beforeSend ->
                     Transport.sendEmpty(endpoint, token, batch, beforeSend)
                 }

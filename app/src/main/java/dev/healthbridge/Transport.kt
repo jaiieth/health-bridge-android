@@ -42,6 +42,22 @@ object Transport {
             .retryOnConnectionFailure(false)
             .build()
 
+    internal fun detailedRequest(endpoint: String, token: String, batchId: String, body: ByteArray): Request {
+        require(receiverBatchId.matches(batchId))
+        return Request.Builder()
+                .url(validateUrl(endpoint))
+                .header("Authorization", "Bearer $token")
+                .header("X-Health-Bridge-Signature", "sha256=" + signature(body, token))
+                .header("X-Health-Bridge-Batch-Id", batchId)
+                .post(body.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .build()
+    }
+
+    internal fun sendDetailed(endpoint: String, token: String, batchId: String, body: ByteArray): ChunkResponse {
+        val request = detailedRequest(endpoint, token, batchId, body)
+        return client.newCall(request).execute().use { ChunkResponse(it.code, it.body?.string().orEmpty()) }
+    }
+
     suspend fun sendEmpty(
         endpoint: String,
         token: String,

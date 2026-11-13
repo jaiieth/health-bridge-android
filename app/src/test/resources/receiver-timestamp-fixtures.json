@@ -1,0 +1,179 @@
+{
+  "node": "v25.9.0",
+  "fixtures": [
+    {
+      "input": "2024-02-29T12:34:56Z",
+      "normalized": "2024-02-29T12:34:56.000000000Z",
+      "receiverAccepts": true,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "2024-02-29T12:34:56.1Z",
+      "normalized": "2024-02-29T12:34:56.100000000Z",
+      "receiverAccepts": true,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "2024-02-29T12:34:56.123Z",
+      "normalized": "2024-02-29T12:34:56.123000000Z",
+      "receiverAccepts": true,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "2024-02-29T12:34:56.123456Z",
+      "normalized": "2024-02-29T12:34:56.123456000Z",
+      "receiverAccepts": true,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "2024-02-29T12:34:56.123456789Z",
+      "normalized": "2024-02-29T12:34:56.123456789Z",
+      "receiverAccepts": true,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "0000-02-29T00:00:00Z",
+      "normalized": "0000-02-29T00:00:00.000000000Z",
+      "receiverAccepts": true,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "9999-12-31T23:59:59.999999999Z",
+      "normalized": "9999-12-31T23:59:59.999999999Z",
+      "receiverAccepts": true,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "2024-02-30T00:00:00Z",
+      "normalized": "2024-02-30T00:00:00.000000000Z",
+      "receiverAccepts": true,
+      "kotlinBlocksRollover": true
+    },
+    {
+      "input": "2023-02-29T00:00:00Z",
+      "normalized": "2023-02-29T00:00:00.000000000Z",
+      "receiverAccepts": true,
+      "kotlinBlocksRollover": true
+    },
+    {
+      "input": "2024-04-31T00:00:00Z",
+      "normalized": "2024-04-31T00:00:00.000000000Z",
+      "receiverAccepts": true,
+      "kotlinBlocksRollover": true
+    },
+    {
+      "input": "2024-01-32T00:00:00Z",
+      "normalized": null,
+      "receiverAccepts": false,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "2024-00-01T00:00:00Z",
+      "normalized": null,
+      "receiverAccepts": false,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "2024-13-01T00:00:00Z",
+      "normalized": null,
+      "receiverAccepts": false,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "2024-01-00T00:00:00Z",
+      "normalized": null,
+      "receiverAccepts": false,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "2024-01-01T24:00:00Z",
+      "normalized": "2024-01-01T24:00:00.000000000Z",
+      "receiverAccepts": true,
+      "kotlinBlocksRollover": true
+    },
+    {
+      "input": "2024-01-01T25:00:00Z",
+      "normalized": null,
+      "receiverAccepts": false,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "2024-01-01T24:00:00.000000000Z",
+      "normalized": "2024-01-01T24:00:00.000000000Z",
+      "receiverAccepts": true,
+      "kotlinBlocksRollover": true
+    },
+    {
+      "input": "2024-01-01T24:00:00.000000001Z",
+      "normalized": null,
+      "receiverAccepts": false,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "2024-01-01T23:60:00Z",
+      "normalized": null,
+      "receiverAccepts": false,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "2024-01-01T23:59:60Z",
+      "normalized": null,
+      "receiverAccepts": false,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "2024-01-01T00:00:00+07:00",
+      "normalized": null,
+      "receiverAccepts": false,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "2024-01-01T00:00:00z",
+      "normalized": null,
+      "receiverAccepts": false,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "2024-01-01T00:00:00.1234567890Z",
+      "normalized": null,
+      "receiverAccepts": false,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "2024-01-01T00:00:00",
+      "normalized": null,
+      "receiverAccepts": false,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "2024-01-01T00:00:00.Z",
+      "normalized": null,
+      "receiverAccepts": false,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": "",
+      "normalized": null,
+      "receiverAccepts": false,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": null,
+      "normalized": null,
+      "receiverAccepts": false,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": 1700000000000,
+      "normalized": null,
+      "receiverAccepts": false,
+      "kotlinBlocksRollover": false
+    },
+    {
+      "input": true,
+      "normalized": null,
+      "receiverAccepts": false,
+      "kotlinBlocksRollover": false
+    }
+  ]
+}

@@ -44,6 +44,14 @@ interface Store {
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun status(s: SyncStatus)
 
     @Transaction
+    suspend fun commitChunkCursors(targets: List<Cursor>): Boolean {
+        if (pending() != null) return false
+        val current = cursors().associate { it.type to it.until }
+        if (targets.any { current[it.type] != it.until }) cursors(targets)
+        return true
+    }
+
+    @Transaction
     suspend fun success(c: List<Cursor>, time: String, isTest: Boolean, result: String) {
         val lastSync = if (isTest) status()?.lastSuccess ?: "Never" else time
         cursors(c)

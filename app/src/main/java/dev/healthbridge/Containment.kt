@@ -28,18 +28,26 @@ object Containment {
         else -> Delivery.BLOCKED
     }
 
-    // There is deliberately no scheduler or health delivery capability in this coordinator.
     suspend fun run(
         store: Store,
         settings: SyncSettings,
         test: Boolean,
+        freshSync: suspend () -> Unit,
         send: suspend (String, String, EmptyTest, suspend () -> Unit) -> Int,
     ) {
         suspend fun status(result: String) {
             store.status((store.status() ?: SyncStatus()).copy(result = result))
         }
         if (!test) {
-            status(if (settings.syncEnabled) "Health sync PAUSED: containment stage" else "Sync OFF")
+            if (!settings.syncEnabled) {
+                status("Sync OFF")
+                return
+            }
+            if (store.pending() != null) {
+                status("Health sync PAUSED: legacy Pending preserved; delivery blocked")
+                return
+            }
+            freshSync()
             return
         }
         var enteredTransport = false

@@ -6,7 +6,7 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SyncControlTest {
-    private class Fixture(enabled: Boolean) {
+    internal class Fixture(enabled: Boolean) {
         val values = mutableMapOf<String, Any>("sync_enabled" to enabled, "minutes" to 75L)
         val calls = mutableListOf<String>()
         private val staged = mutableMapOf<String, Any>()
@@ -28,7 +28,8 @@ class SyncControlTest {
                 else -> error(method.name)
             }
         } as SharedPreferences
-        val control = SyncControl(Settings(prefs), object : SyncScheduler {
+        val settings = Settings(prefs)
+        val control = SyncControl(settings, object : SyncScheduler {
             override fun schedule(minutes: Long) { calls += "schedule:$minutes" }
             override fun cancel() {
                 assertEquals(false, values["sync_enabled"])

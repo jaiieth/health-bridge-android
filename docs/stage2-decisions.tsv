@@ -1,0 +1,5 @@
+ts	phase	decision	why	evidence	result
+2026-11-13T04:37:19Z	ground	Keep containment as the sole dispatcher	OFF and isolated Test must precede any health capability	app/src/main/java/dev/healthbridge/Containment.kt	implemented; verification pending
+2026-11-13T04:37:19Z	cursor	Skip target cursor writes already committed	Replay after Room commit must not advance cursors twice	app/src/test/java/dev/healthbridge/SyncWiringTest.kt	initial forced run passed
+2026-11-13T04:37:19Z	review	Require directory durability again before resuming delivery	A visible rename after failed fsync is not proof of power-loss durability	app/src/main/java/dev/healthbridge/ChunkOutbox.kt	fix in progress
+2026-11-13T04:39:39Z	verify	Accept final forced JVM run	All required gates need execution evidence rather than cached results	/home/ubuntu/scratch/phase23-logs/stage2-tests.log	133 tests; zero failures, errors, or skips; 25 tasks executed
