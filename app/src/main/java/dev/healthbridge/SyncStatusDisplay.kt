@@ -38,7 +38,7 @@ object SyncStatusDisplay {
 
     private fun description(reason: ChunkReason): String = when (reason) {
         ChunkReason.NONE -> "No stop reason was recorded."
-        ChunkReason.FLAG_OFF -> "Automatic sync was off when this result was recorded."
+        ChunkReason.FLAG_OFF -> "Health delivery was disabled by consent or the fresh-chunking gate."
         ChunkReason.LEGACY_PENDING -> "A legacy Pending batch requires review before health sync can continue."
         ChunkReason.INVALID_TIMESTAMP -> "A record has an invalid timestamp."
         ChunkReason.UNKNOWN_ACCEPTANCE -> "Receiver acceptance is unknown. Check the receiver before any resend."

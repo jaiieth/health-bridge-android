@@ -6,7 +6,7 @@ This scratch-only preparation ports the reference chunking patch onto containmen
 
 SyncWorker holds AppState.mutex and calls Containment.run. The dispatcher checks Settings.syncEnabled first. OFF writes `Sync OFF` and returns before credentials, Pending, cursors, collection, or transport are accessed. While ON, Test invokes only Transport.sendEmpty. It neither inspects nor changes Pending or the chunk outbox. Normal work checks Pending next. Any legacy row produces a paused status without reading cursors or collecting. Only the remaining case enters fresh chunk sync.
 
-The alternative was a second dispatcher around Containment.run. Keeping the gates together makes the tested coordinator the production entry point and avoids duplicating consent checks. There is no chunking preference or alternate legacy delivery branch. ChunkSync's enabled parameter is an internal consent guard, not an independent feature flag.
+The alternative was a second dispatcher around Containment.run. Keeping the gates together makes the tested coordinator the production entry point and avoids duplicating consent checks. There is no second user preference or alternate legacy delivery branch. ChunkContracts.freshChunkingEnabled is an internal build-time feature gate defaulting OFF. Production passes consent AND this gate to ChunkSync; consent ON alone is not readiness. The empty Test bypasses this gate.
 
 Transport.send and the Room entities and schema remain unchanged. The new transport method builds the same envelope and HMAC headers from immutable child bytes. It reads the response body for strict ACK validation. The new path never calls Transport.send or Store.success, writes Pending, deletes Pending, or changes its retry accounting.
 

@@ -15,6 +15,5 @@ class SyncControl(private val settings: Settings, private val scheduler: SyncSch
 
     fun save(endpoint: String, token: String, minutes: Long) {
         settings.save(endpoint, token, minutes)
-        if (settings.syncEnabled) scheduler.schedule(settings.minutes)
     }
 }

@@ -33,7 +33,7 @@ class SyncStatusDisplayTest {
     }
 
     @Test fun progressUsesFirstUnacknowledgedIndexAndPreservesFinalUncertainty() {
-        assertEquals("0 of 0 chunks are recorded. Health sync is incomplete. Automatic sync was off when this result was recorded. No automatic resend will run.",
+        assertEquals("0 of 0 chunks are recorded. Health sync is incomplete. Health delivery was disabled by consent or the fresh-chunking gate. No automatic resend will run.",
             SyncStatusDisplay.progress("Health sync PLAN: 0/0; FLAG_OFF"))
         assertEquals("1 of 1 chunks have recorded acknowledgements. Health sync completion is recorded.",
             SyncStatusDisplay.progress("Health sync DONE: 1/1; NONE"))
@@ -93,7 +93,7 @@ class SyncStatusDisplayTest {
     @Test fun reasonsAreExplicitAndSuccessTimeIsIndependentOfResult() {
         val reasons = mapOf(
             "NONE" to "No stop reason was recorded.",
-            "FLAG_OFF" to "Automatic sync was off when this result was recorded.",
+            "FLAG_OFF" to "Health delivery was disabled by consent or the fresh-chunking gate.",
             "LEGACY_PENDING" to "A legacy Pending batch requires review before health sync can continue.",
             "INVALID_TIMESTAMP" to "A record has an invalid timestamp.",
             "UNKNOWN_ACCEPTANCE" to "Receiver acceptance is unknown. Check the receiver before any resend.",

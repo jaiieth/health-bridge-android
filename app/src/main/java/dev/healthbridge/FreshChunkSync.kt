@@ -24,7 +24,7 @@ internal suspend fun runFreshChunkSync(context: Context, store: Store, settings:
         require(settings.token.isNotBlank())
         Transport.sendDetailed(settings.endpoint, settings.token, batchId, body)
     })
-    val result = runner.run(settings.syncEnabled, settings.endpoint, ChunkContracts.verifiedMapping) {
+    val result = runner.run(settings.syncEnabled && ChunkContracts.freshChunkingEnabled, settings.endpoint, ChunkContracts.verifiedMapping) {
         Transport.validateUrl(settings.endpoint)
         require(settings.token.isNotBlank())
         val reader = HealthReader(context)
