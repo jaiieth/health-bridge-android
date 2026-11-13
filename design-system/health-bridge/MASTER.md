@@ -72,7 +72,7 @@
 | Item | Evidence or limitation |
 | --- | --- |
 | Skill repository | Local `/home/ubuntu/tools/ui-ux-pro-max-skill`, commit `6ae86f61f520d6ca229d2f40e070410638c908c5` |
-| CLI | `ui-ux-pro-max-cli 2.5.0`, distinct from skill version 2.15.0 |
+| CLI | CLI package `ui-ux-pro-max-cli 2.5.0` from `cli/package.json`; repository commit `6ae86f61f520d6ca229d2f40e070410638c908c5` dated 2026-11-10; no other version string is declared, and an earlier 2.15.0 claim is withdrawn as unverified. |
 | Scoped searches | Six offline searches run for this documentation pass through `.claude/skills/ui-ux-pro-max/scripts/search.py`, each with `-n 2`; queries below are exact. They explain applicable rules, not historical generation of this UI. |
 | Not skill output | Layout composition, exact palette, and section order are manual choices. Exact dimension values and native system sans are repository choices. No generated font or layout recommendation is claimed as implemented. |
 
