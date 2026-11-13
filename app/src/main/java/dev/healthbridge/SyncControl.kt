@@ -18,7 +18,19 @@ class SyncControl(
         return true
     }
 
+    fun enforceDisabled(): Boolean {
+        if (freshChunkingEnabled) return true
+        val persistedOff = runCatching { settings.persistSyncDisabled() }.getOrDefault(false)
+        val cancelled = runCatching { scheduler.cancel() }.isSuccess
+        return persistedOff && cancelled
+    }
+
     fun save(endpoint: String, token: String, minutes: Long) {
+        if (!freshChunkingEnabled) {
+            enforceDisabled()
+            settings.save(endpoint, token, minutes)
+            return
+        }
         val intervalChanged = settings.minutes != minutes
         settings.save(endpoint, token, minutes)
         if (settings.syncEnabled && intervalChanged) scheduler.schedule(minutes)

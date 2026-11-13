@@ -10,13 +10,22 @@ class SyncControlTest {
         val values = mutableMapOf<String, Any>("sync_enabled" to enabled, "minutes" to 75L)
         val calls = mutableListOf<String>()
         var writes = 0
+        var commitSucceeds = true
+        var applyWrites = true
+        var cancelFails = false
+        val cancelledStates = mutableListOf<Boolean>()
         private val staged = mutableMapOf<String, Any>()
         private val editor: SharedPreferences.Editor = Proxy.newProxyInstance(
             javaClass.classLoader, arrayOf(SharedPreferences.Editor::class.java)
         ) { proxy, method, args ->
             when (method.name) {
                 "putBoolean", "putString", "putLong" -> { staged[args!![0] as String] = args[1]; proxy }
-                "commit" -> { writes++; values.putAll(staged); staged.clear(); true }
+                "commit" -> {
+                    writes++
+                    if (applyWrites) values.putAll(staged)
+                    staged.clear()
+                    commitSucceeds
+                }
                 else -> error(method.name)
             }
         } as SharedPreferences.Editor
@@ -33,8 +42,9 @@ class SyncControlTest {
         val control = SyncControl(settings, object : SyncScheduler {
             override fun schedule(minutes: Long) { calls += "schedule:$minutes" }
             override fun cancel() {
-                assertEquals(false, values["sync_enabled"])
+                cancelledStates += values["sync_enabled"] as Boolean
                 calls += "cancel"
+                check(!cancelFails) { "synthetic cancellation failure" }
             }
         }, freshChunkingEnabled)
     }
@@ -56,6 +66,7 @@ class SyncControlTest {
         assertEquals(false, fixture.values["sync_enabled"])
         assertEquals(listOf("cancel"), fixture.calls)
         assertEquals(1, fixture.writes)
+        assertEquals(listOf(false), fixture.cancelledStates)
         assertFalse(fixture.control.setEnabled(true))
         assertEquals(false, fixture.values["sync_enabled"])
         assertEquals(listOf("cancel"), fixture.calls)
@@ -96,6 +107,7 @@ class SyncControlTest {
         assertTrue(fixture.control.setEnabled(false))
         assertEquals(false, fixture.values["sync_enabled"])
         assertEquals(listOf("cancel"), fixture.calls)
+        assertEquals(listOf(false), fixture.cancelledStates)
     }
 
     @Test fun saveWhileOnWithChangedIntervalSchedulesNewIntervalWithoutCanceling() {
@@ -121,4 +133,81 @@ class SyncControlTest {
         assertEquals(false, fixture.values["sync_enabled"])
         assertEquals(emptyList<String>(), fixture.calls)
     }
+
+    @Test fun gatedSaveClearsStaleConsentAndCancelsInsteadOfRescheduling() {
+        val fixture = Fixture(true, freshChunkingEnabled = false)
+        fixture.control.save("https://example.invalid/hook", "synthetic", 120)
+        assertEquals(false, fixture.values["sync_enabled"])
+        assertEquals(120L, fixture.values["minutes"])
+        assertEquals(listOf("cancel"), fixture.calls)
+    }
+
+    @Test fun gatedSaveWhileAlreadyOffStillCancelsWithoutScheduling() {
+        val fixture = Fixture(false, freshChunkingEnabled = false)
+        fixture.control.save("https://example.invalid/hook", "synthetic", 120)
+        assertEquals(false, fixture.values["sync_enabled"])
+        assertEquals(listOf("cancel"), fixture.calls)
+    }
+
+    @Test fun gatedSaveWithUnchangedIntervalAlsoClearsStaleConsentAndCancels() {
+        val fixture = Fixture(true, freshChunkingEnabled = false)
+        fixture.control.save("https://example.invalid/hook", "synthetic", 75)
+        assertEquals(false, fixture.values["sync_enabled"])
+        assertEquals(listOf("cancel"), fixture.calls)
+    }
+
+
+    @Test fun gatedEnforcementClearsStaleConsentBeforeCancellation() {
+        val fixture = Fixture(true, freshChunkingEnabled = false)
+        assertTrue(fixture.control.enforceDisabled())
+        assertEquals(false, fixture.values["sync_enabled"])
+        assertEquals(listOf("cancel"), fixture.calls)
+        assertEquals(listOf(false), fixture.cancelledStates)
+        assertEquals(1, fixture.writes)
+    }
+
+    @Test fun gatedEnforcementRejectsFailedCommitEvenWhenReadbackIsOff() {
+        val fixture = Fixture(true, freshChunkingEnabled = false)
+        fixture.commitSucceeds = false
+        assertFalse(fixture.control.enforceDisabled())
+        assertEquals(false, fixture.values["sync_enabled"])
+        assertEquals(listOf("cancel"), fixture.calls)
+    }
+
+    @Test fun gatedEnforcementRejectsUnchangedReadbackAndStillCancels() {
+        val fixture = Fixture(true, freshChunkingEnabled = false)
+        fixture.applyWrites = false
+        assertFalse(fixture.control.enforceDisabled())
+        assertEquals(true, fixture.values["sync_enabled"])
+        assertEquals(listOf("cancel"), fixture.calls)
+        assertEquals(listOf(true), fixture.cancelledStates)
+    }
+
+    @Test fun enforcementWithFlagEnabledDoesNothingForEitherStoredState() {
+        listOf(false, true).forEach { enabled ->
+            val fixture = Fixture(enabled, freshChunkingEnabled = true)
+            assertTrue(fixture.control.enforceDisabled())
+            assertEquals(enabled, fixture.values["sync_enabled"])
+            assertEquals(0, fixture.writes)
+            assertTrue(fixture.calls.isEmpty())
+        }
+    }
+
+    @Test fun gatedSaveDoesNotThrowWhenCancellationFails() {
+        val fixture = Fixture(true, freshChunkingEnabled = false)
+        fixture.cancelFails = true
+        fixture.control.save("https://example.invalid/hook", "synthetic", 120)
+        assertEquals(false, fixture.values["sync_enabled"])
+        assertEquals(listOf("cancel"), fixture.calls)
+        assertEquals(120L, fixture.values["minutes"])
+    }
+
+    @Test fun gatedEnforcementReportsCancellationFailureWithoutThrowing() {
+        val fixture = Fixture(true, freshChunkingEnabled = false)
+        fixture.cancelFails = true
+        assertFalse(fixture.control.enforceDisabled())
+        assertEquals(false, fixture.values["sync_enabled"])
+        assertEquals(listOf("cancel"), fixture.calls)
+    }
+
 }

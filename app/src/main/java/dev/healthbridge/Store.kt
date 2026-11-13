@@ -94,6 +94,11 @@ class Settings(private val prefs: SharedPreferences) : SyncSettings {
             prefs.edit().putBoolean("sync_enabled", value).commit()
         }
 
+    internal fun persistSyncDisabled(): Boolean {
+        val committed = prefs.edit().putBoolean("sync_enabled", false).commit()
+        return !syncEnabled && committed
+    }
+
     fun save(endpoint: String, token: String, minutes: Long) {
         require(
             prefs

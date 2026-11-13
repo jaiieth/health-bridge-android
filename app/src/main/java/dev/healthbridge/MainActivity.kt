@@ -39,6 +39,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var editEndpoint: Button
     private var changingControl = false
     private var refreshing = false
+    private var startupContainmentComplete = false
     private val enabled get() = Settings(this).syncEnabled
     private val syncControl by lazy {
         SyncControl(Settings(this), object : SyncScheduler {
@@ -132,7 +133,9 @@ class MainActivity : ComponentActivity() {
         tokenField = token
         val minutes = input(setup, "Interval in minutes · 15 to 525600", InputType.TYPE_CLASS_NUMBER)
         minutes.setText(getString(R.string.interval_value, settings.minutes))
-        setupMessage = text(setup, "Saving settings updates the interval when sync is ON. It does not turn sync on.")
+        setupMessage = text(setup, if (ChunkContracts.freshChunkingEnabled)
+            "Saving settings updates the interval when sync is ON. It does not turn sync on."
+            else "Saving settings keeps health sync OFF in this build.")
         setupMessage.accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_ASSERTIVE
         val save = button(setup, "Save settings") {}
         save.setOnClickListener {
@@ -221,6 +224,11 @@ class MainActivity : ComponentActivity() {
             }
         }
         lifecycleScope.launch {
+            val disabled = withContext(Dispatchers.IO) {
+                AppState.mutex.withLock { syncControl.enforceDisabled() }
+            }
+            startupContainmentComplete = true
+            if (!disabled) setupMessage.setText(R.string.control_save_failed)
             while (true) { refresh(); delay(2000) }
         }
     }
@@ -229,7 +237,7 @@ class MainActivity : ComponentActivity() {
     override fun onStop() { AppState.foreground = false; super.onStop() }
 
     private fun refresh() {
-        if (refreshing) return
+        if (!startupContainmentComplete || refreshing) return
         refreshing = true
         lifecycleScope.launch {
             try {
