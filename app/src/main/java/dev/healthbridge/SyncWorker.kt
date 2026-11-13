@@ -10,6 +10,16 @@ object Schedule {
     private val network =
         Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
 
+    fun periodic(context: Context, minutes: Long) {
+        WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+            "periodic",
+            ExistingPeriodicWorkPolicy.UPDATE,
+            PeriodicWorkRequestBuilder<SyncWorker>(minutes, java.util.concurrent.TimeUnit.MINUTES)
+                .setConstraints(network)
+                .build(),
+        )
+    }
+
     fun manual(context: Context, test: Boolean = false) {
         WorkManager.getInstance(context)
             .enqueueUniqueWork(

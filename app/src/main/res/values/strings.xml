@@ -1,4 +1,13 @@
 <resources>
   <string name="app_name">Health Bridge</string>
-  <string name="permission_rationale">Health Bridge reads sleep, HRV, resting heart rate, heart rate samples, steps and exercise and sends them to your saved HTTPS webhook. All six permissions are required. You can revoke access in Health Connect. Queued health data remains on this device until delivered. Tests send no health records.</string>
+  <string name="permission_rationale">Health Bridge reads sleep, HRV, resting heart rate, heart rate samples, steps and exercise for future delivery. Health delivery is currently paused during containment. All six permissions are required. You can revoke access in Health Connect. Queued health data remains on this device until delivered. Tests send no health records.</string>
+    <string name="interval_value">%1$d</string>
+    <string name="health_connect_unavailable">Install or update Health Connect on a supported device.</string>
+    <string name="test_requested">Test requested. Waiting for a recorded acknowledgement.</string>
+    <string name="control_save_failed">Could not save sync control. Try again.</string>
+    <string name="status_details">%1$s\n%2$s\n%3$s</string>
+    <string name="destination_host">Destination · %1$s</string>
+    <string name="saving_settings">Saving settings…</string>
+    <string name="save_settings">Save settings</string>
+    <string name="saving_sync_preference">Saving sync preference…</string>
 </resources>

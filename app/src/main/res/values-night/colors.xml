@@ -1,0 +1,16 @@
+<resources>
+    <color name="hb_background">#0D191F</color>
+    <color name="hb_surface">#172A33</color>
+    <color name="hb_text">#E4F1F6</color>
+    <color name="hb_muted">#B3C8D2</color>
+    <color name="hb_primary">#8CD5E8</color>
+    <color name="hb_on_primary">#003542</color>
+    <color name="hb_off">#B3C8D2</color>
+    <color name="hb_blocked">#FFB4B8</color>
+    <color name="hb_paused">#F4CE80</color>
+    <color name="hb_waiting">#8CD5E8</color>
+    <color name="hb_unknown">#D4BFEA</color>
+    <color name="hb_outline">#90AAB7</color>
+    <color name="hb_disabled">#2C404A</color>
+    <color name="hb_on_disabled">#B3C8D2</color>
+</resources>

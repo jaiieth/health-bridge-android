@@ -1,6 +1,6 @@
 # Health Bridge
 
-Health Bridge reads six Health Connect record types and sends signed JSON batches to your HTTPS webhook. It has no backend, analytics SDK, or Google Drive integration.
+Health Bridge is currently in containment. Health collection and delivery are paused. Explicit webhook tests send one signed empty batch with no automatic retry. It has no backend, analytics SDK, or Google Drive integration. See [the current UI rationale](docs/ui-design-rationale.md).
 
 ## Build and set up
 
@@ -10,13 +10,20 @@ Health Bridge reads six Health Connect record types and sends signed JSON batche
 4. Install `app/build/outputs/apk/debug/app-debug.apk` on Android 8 or later. Health Connect requires a supported Android 9+ device. Android 14+ includes the provider; earlier supported devices need the Health Connect app. Unsupported devices display a status message.
 5. Enter your HTTPS webhook URL, a nonempty printable ASCII bearer token, and an interval in minutes. Save settings. The default is 360 minutes and the minimum is 15 minutes.
 6. Tap **Grant health permissions**, read the rationale, and grant all six read permissions. The screen identifies partial and denied access. Optional background read access is requested only when the provider supports it.
-7. Tap **Test webhook** to send an empty batch without health access, then **Sync now** to export health records. Results appear on the screen. A pending batch must finish before a test can run.
+7. Sync defaults to OFF. Use **Send test** for a separate, explicit empty webhook test without health access. ON schedules only the containment worker, which records PAUSED. **Record paused health status** cannot export health records. Opening the app or saving settings pauses health work. Retained data is unchanged and does not prevent an isolated empty test.
 
 For this workspace, source `/home/ubuntu/toolchain/env.sh` to use the installed local JDK and SDK. This host is ARM64; Android's x86-64 native build tools run through QEMU with `QEMU_LD_PREFIX=/usr/x86_64-linux-gnu`. Run `scripts/verify.sh` to build, lint, run unit tests, and print the APK path, byte size, SHA-256, and manifest badging. Reports are saved under `verification/`.
 
 CI runs the wrapper on pushes and pull requests and uploads the debug APK. Nothing is deployed or published.
 
-## Sync behavior
+## Current containment behavior
+
+The encrypted `Settings.syncEnabled` preference is the only switch state. Explicit ON schedules the existing worker; explicit OFF cancels health work. The worker records OFF or PAUSED without reading or sending health data. Save and startup never schedule work. Retained rows lock endpoint and token edits. Empty tests bypass the retained queue, record their outcome, and run once without automatic retry. A recorded test acceptance does not confirm health delivery.
+
+## Historical export design, currently disabled
+
+The following collection, cursor, and retry description documents the earlier export design. It does not describe the contained worker or the current UI.
+
 
 Read types are SleepSession, HeartRateVariabilityRmssd, RestingHeartRate, HeartRate series, Steps, and ExerciseSession. Sync skips when a required permission is missing. Periodic and manual sync use unique WorkManager requests with a connected-network constraint. Android can defer background work. Collection in the background additionally requires the provider's optional background read permission. Without it, keep the app open while collecting. No foreground service polls for data.
 

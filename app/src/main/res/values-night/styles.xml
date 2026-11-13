@@ -1,0 +1,14 @@
+<resources>
+    <style name="HealthBridgeTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">@color/hb_primary</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:statusBarColor">@color/hb_background</item>
+        <item name="android:navigationBarColor">@color/hb_background</item>
+        <item name="android:windowBackground">@color/hb_background</item>
+        <item name="android:colorControlNormal">@color/hb_outline</item>
+        <item name="android:textColorPrimary">@color/hb_text</item>
+        <item name="android:textColorSecondary">@color/hb_muted</item>
+        <item name="android:colorError">@color/hb_blocked</item>
+    </style>
+</resources>
