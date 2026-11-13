@@ -11,7 +11,7 @@ import org.junit.rules.TemporaryFolder
 class OutboxEnvelopeTest {
     @get:Rule val temporary = TemporaryFolder()
     private fun manifest(id: String = "generation") = ChunkManifest(id,
-        parentFingerprint("endpoint", emptyList(), emptyList(), emptyMap()), "endpoint",
+        parentFingerprint(sha256("endpoint".toByteArray()), emptyList(), emptyList(), emptyMap()), sha256("endpoint".toByteArray()),
         emptyList(), emptyList(), emptyMap(), 0, 0, ChunkPhase.STAGE,
         listOf(ChunkChild(0, "batch", sha256("body".toByteArray()), 0)))
     private fun sized(file: File, length: Long) = RandomAccessFile(file, "rw").use { it.setLength(length) }
@@ -25,12 +25,12 @@ class OutboxEnvelopeTest {
         val m = manifest()
         // Fill the control slice for this reservation-only arithmetic fixture.
         repeat(32) { sized(File(root, "receipt-control-$it.json"), 2048) }
-        val overhead = 4 + 3 * manifestEncodedBytes(m) + 256
+        val overhead = 4 + 3 * manifestEncodedBytes(m) + 256 + 2 * attemptIntentBudget(manifestEncodedBytes(m))
         sized(File(root, "retained-body"), OUTBOX_HARD_QUOTA_BYTES - OUTBOX_CONTROL_RESERVE_BYTES - overhead)
         val outbox = ChunkOutbox(root)
         val reservation = outbox.reserve(m, 4)
         assertEquals(OUTBOX_HARD_QUOTA_BYTES, reservation.peak)
-        assertEquals(outbox.retainedBytes() + outbox.controlBytes() + 4 + 3 * manifestEncodedBytes(m) + 256, reservation.peak)
+        assertEquals(outbox.retainedBytes() + outbox.controlBytes() + 4 + 3 * manifestEncodedBytes(m) + 256 + 2 * attemptIntentBudget(manifestEncodedBytes(m)), reservation.peak)
         val refused = assertThrows(java.io.IOException::class.java) { outbox.reserve(m, 5) }
         assertNotNull(refused)
         assertTrue(total(root) <= OUTBOX_HARD_QUOTA_BYTES)
@@ -50,7 +50,7 @@ class OutboxEnvelopeTest {
     @Test fun payloadCeilingLeavesRoomForDurableRefusalWithinTheTotalEnvelope() {
         val root = temporary.newFolder()
         val m = manifest()
-        val overhead = 4 + 3 * manifestEncodedBytes(m) + 256
+        val overhead = 4 + 3 * manifestEncodedBytes(m) + 256 + 2 * attemptIntentBudget(manifestEncodedBytes(m))
         sized(File(root, "retained-body"), OUTBOX_HARD_QUOTA_BYTES - OUTBOX_CONTROL_RESERVE_BYTES - overhead)
         var highWater = 0L
         val outbox = ChunkOutbox(root, DurableFiles(fault = { _, _ ->
@@ -59,7 +59,7 @@ class OutboxEnvelopeTest {
         }))
         val reservation = outbox.reserve(m, 4)
         assertEquals(OUTBOX_HARD_QUOTA_BYTES - OUTBOX_CONTROL_RESERVE_BYTES, reservation.peak)
-        outbox.beginReserved(reservation)
+        outbox.beginReserved(reservation, m, listOf(4L))
         outbox.stageReservedBody(reservation, 0, "body".toByteArray(), 4)
         outbox.publishReserved(reservation, m)
         outbox.save(m.copy(updatedAt = 1))
@@ -72,7 +72,7 @@ class OutboxEnvelopeTest {
         assertTrue(total(root) <= OUTBOX_HARD_QUOTA_BYTES)
     }
 
-    @Test fun nearHardQuotaMeasuresEveryAtomicCopyAndStagingDeletion() {
+    @Test fun nearHardQuotaMeasuresEveryAtomicCopyAndRetainsIntentStaging() {
         val root = temporary.newFolder()
         data class Peak(val bytes: Long, val atMillis: Long, val file: String)
         val peaks = sortedMapOf<String, Peak>()
@@ -111,7 +111,7 @@ class OutboxEnvelopeTest {
         fun stage(m: ChunkManifest, bodies: List<ByteArray>, destination: ChunkOutbox = outbox): ChunkOutbox.Reservation {
             val reservation = destination.reserve(m, bodies.sumOf { it.size.toLong() })
             if (destination === outbox) admittedPeak = reservation.peak
-            destination.beginReserved(reservation)
+            destination.beginReserved(reservation, m, bodies.map { it.size.toLong() })
             bodies.forEachIndexed { index, body -> destination.stageReservedBody(reservation, index, body, body.size) }
             destination.publishReserved(reservation, m)
             return reservation
@@ -126,7 +126,7 @@ class OutboxEnvelopeTest {
         probe.save(done(probeManifest))
         val retainedMetadata = probe.retainedBytes() - probeBodies.sumOf { it.size.toLong() }
         val retainedBodyBudget = OUTBOX_HARD_QUOTA_BYTES - OUTBOX_CONTROL_RESERVE_BYTES -
-            bodies.sumOf { it.size.toLong() } - 3 * manifestEncodedBytes(attempt) - 256 - retainedMetadata
+            bodies.sumOf { it.size.toLong() } - 3 * manifestEncodedBytes(attempt) - 256 - 2 * attemptIntentBudget(manifestEncodedBytes(attempt)) - retainedMetadata
         val lastSize = (retainedBodyBudget - 27L * 524_288).toInt()
         assertTrue(lastSize in 1024..524_288)
         val (retained, retainedBodies) = fixture("retained", 28, lastSize)
@@ -143,18 +143,18 @@ class OutboxEnvelopeTest {
         operation = "backpressure"
         outbox.recordBackpressure(ChunkReason.OUTBOX_QUOTA, "refused", OUTBOX_HARD_QUOTA_BYTES + 1)
         for (name in listOf("active", "active-proof")) assertTrue(File(root, name).delete())
-        operation = "staging-delete"
-        assertNull(outbox.recoverStaging())
-        assertFalse(File(root, attempt.generation).exists())
+        operation = "staging-retain"
+        val beforeRecovery = inventory(root)
+        repeat(2) { assertNull(outbox.recoverStaging()); assertEquals(beforeRecovery, inventory(root)) }
+        assertTrue(File(root, attempt.generation).isDirectory)
         assertTrue(File(root, retained.generation).isDirectory)
         val requiredWrites = listOf("near-limit-stage/reservation", "near-limit-stage/child",
             "near-limit-stage/manifest.json", "near-limit-stage/published.json", "near-limit-stage/previous",
             "near-limit-stage/active-proof", "near-limit-stage/active", "near-limit-save/manifest.json",
-            "backpressure/backpressure", "staging-delete/staging-tombstone")
+            "backpressure/backpressure", "near-limit-stage/attempt-intent.json")
         for (write in requiredWrites) for (boundary in DurableBoundary.entries) {
             assertNotNull("$write/$boundary", peaks["$write/$boundary"])
         }
-        assertNotNull(peaks["staging-delete/near-limit/BODY_REMOVED"])
         peaks.forEach { (key, value) -> println("OUTBOX_PEAK $key total=${value.bytes} atMillis=${value.atMillis} file=${value.file} reservationPeak=${reservation.peak}") }
     }
 
@@ -162,8 +162,9 @@ class OutboxEnvelopeTest {
         for (version in listOf("1", "999")) {
             val root = temporary.newFolder()
             val staged = ChunkOutbox(root)
-            val reservation = staged.reserve(manifest(), 4)
-            staged.beginReserved(reservation)
+            val m = manifest()
+            val reservation = staged.reserve(m, 4)
+            staged.beginReserved(reservation, m, listOf(4L))
             staged.stageReservedBody(reservation, 0, "body".toByteArray(), 4)
             File(root, "backpressure").writeText(listOf(version, "OUTBOX_QUOTA", "generation",
                 OUTBOX_HARD_QUOTA_BYTES + 1, OUTBOX_HARD_QUOTA_BYTES, 0, FreshGenerationLimits().manifestBytes).joinToString("\n"))

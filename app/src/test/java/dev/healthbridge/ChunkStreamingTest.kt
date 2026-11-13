@@ -100,7 +100,7 @@ class ChunkStreamingTest {
             val ids = List(records.size) { "c${it}" + "z".repeat(it % 4 * 7) }
             val manifest = runBlocking {
                 StreamingChunkPlanner(outbox, ChunkContracts.verifiedMapping, limits,
-                    { if (next++ == -1) "generation" else ids[next - 1] }, { 1700L }).stage(input(records), "endpoint")
+                    { if (next++ == -1) "generation" else ids[next - 1] }, { 1700L }).stage(input(records), sha256("endpoint".toByteArray()))
             }
             val expected = ChunkPartitioner.partition(records, ids, ProductionReceiverMapping(), limits) as ChunkPlan.Ready
             assertEquals(expected.children.map { it.batchId }, manifest.children.map { it.batchId })
@@ -338,7 +338,7 @@ class ChunkStreamingTest {
             assertThrows(IllegalArgumentException::class.java) { runBlocking {
                 StreamingChunkPlanner(outbox, syntheticMapping, ChunkLimits(count = 1),
                     { if (calls++ == 0) "generation" else childId }, { 1700L })
-                    .stage(input(listOf(syntheticRecord("a"), syntheticRecord("b"))), "endpoint")
+                    .stage(input(listOf(syntheticRecord("a"), syntheticRecord("b"))), sha256("endpoint".toByteArray()))
             } }
             assertNull(outbox.load())
             assertFalse(File(folder, "active").exists())

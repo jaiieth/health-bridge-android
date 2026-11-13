@@ -11,8 +11,8 @@ import org.junit.rules.TemporaryFolder
 
 class OutboxAdmissionTest {
     @get:Rule val temporary = TemporaryFolder()
-    private fun manifest() = ChunkManifest("generation", parentFingerprint("endpoint", emptyList(), emptyList(), emptyMap()),
-        "endpoint", emptyList(), emptyList(), emptyMap(), 0, 0, ChunkPhase.STAGE,
+    private fun manifest() = ChunkManifest("generation", parentFingerprint(sha256("endpoint".toByteArray()), emptyList(), emptyList(), emptyMap()),
+        sha256("endpoint".toByteArray()), emptyList(), emptyList(), emptyMap(), 0, 0, ChunkPhase.STAGE,
         listOf(ChunkChild(0, "batch", sha256("body".toByteArray()), 0)))
     private fun inventory(root: File) = root.walkTopDown().filter { it.isFile }.associate {
         val digest = java.security.MessageDigest.getInstance("SHA-256")
@@ -27,7 +27,7 @@ class OutboxAdmissionTest {
         for (delta in -1L..1L) {
             val root = temporary.newFolder()
             val m = manifest()
-            val added = 4 + 3 * manifestEncodedBytes(m) + 256
+            val added = 4 + 3 * manifestEncodedBytes(m) + 256 + 2 * attemptIntentBudget(manifestEncodedBytes(m))
             val retained = OUTBOX_HARD_QUOTA_BYTES - OUTBOX_CONTROL_RESERVE_BYTES - added + delta
             RandomAccessFile(File(root, "unknown-pending.tmp"), "rw").use { it.setLength(retained) }
             val outbox = ChunkOutbox(root)
@@ -52,14 +52,14 @@ class OutboxAdmissionTest {
         val record = syntheticRecord("pending")
         val body = ChunkPartitioner.envelope("batch", listOf(record))
         val first = manifest().copy(recordIds = listOf(record.recordId), recordHashes = listOf(sha256(record.json.toByteArray())),
-            fingerprint = parentFingerprint("endpoint", listOf(record.recordId), listOf(sha256(record.json.toByteArray())), emptyMap()),
+            fingerprint = parentFingerprint(sha256("endpoint".toByteArray()), listOf(record.recordId), listOf(sha256(record.json.toByteArray())), emptyMap()),
             children = listOf(ChunkChild(0, "batch", sha256(body), 1)))
         val outbox = ChunkOutbox(root)
         outbox.stage(first, ChunkPlan.Ready(listOf(PlannedChild("batch", listOf(record), body, 2))))
         val before = inventory(root)
         val second = manifest().copy(generation = "second", recordIds = List(1300) { "\u0000".repeat(1000) },
             recordHashes = List(1300) { "0".repeat(64) })
-        val bodies = OUTBOX_HARD_QUOTA_BYTES - OUTBOX_CONTROL_RESERVE_BYTES - 3 * manifestEncodedBytes(second) - 256
+        val bodies = OUTBOX_HARD_QUOTA_BYTES - OUTBOX_CONTROL_RESERVE_BYTES - 3 * manifestEncodedBytes(second) - 256 - 2 * attemptIntentBudget(manifestEncodedBytes(second))
         assertTrue(bodies <= 100L * 524_288)
         val empty = ChunkOutbox(temporary.newFolder())
         assertEquals(OUTBOX_HARD_QUOTA_BYTES - OUTBOX_CONTROL_RESERVE_BYTES, empty.reserve(second, bodies).peak)
@@ -97,7 +97,7 @@ class OutboxAdmissionTest {
             }))
             val m = manifest()
             val r = outbox.reserve(m, 4)
-            val attempt = outbox.beginReserved(r)
+            val attempt = outbox.beginReserved(r, m, listOf(4L))
             assertThrows(IOException::class.java) {
                 try {
                     outbox.stageReservedBody(r, 0, "body".toByteArray(), 4)
@@ -122,7 +122,7 @@ class OutboxAdmissionTest {
         }))
         val m = runBlocking {
             StreamingChunkPlanner(outbox, syntheticMapping, ChunkLimits(), { "near-${id++}" }, { 0 }).stage(
-                FreshChunkInput(emptyMap(), FreshRecordProducer { accept -> repeat(count) { accept(record) } }), "endpoint")
+                FreshChunkInput(emptyMap(), FreshRecordProducer { accept -> repeat(count) { accept(record) } }), sha256("endpoint".toByteArray()))
         }
         assertEquals(ChunkPhase.STAGE, m.phase)
         val actual = File(root, "${m.generation}/manifest.json").length()
@@ -145,7 +145,7 @@ class OutboxAdmissionTest {
             accept(syntheticRecord(if (pass++ == 0) "first" else "changed"))
         })
         assertThrows(IllegalStateException::class.java) { runBlocking {
-            StreamingChunkPlanner(ChunkOutbox(root), syntheticMapping, ChunkLimits(), { "change-${id++}" }, { 0 }).stage(input, "endpoint")
+            StreamingChunkPlanner(ChunkOutbox(root), syntheticMapping, ChunkLimits(), { "change-${id++}" }, { 0 }).stage(input, sha256("endpoint".toByteArray()))
         } }
         assertEquals(before, inventory(root))
     }
@@ -158,12 +158,12 @@ class OutboxAdmissionTest {
         }))
         val m = manifest()
         val r = outbox.reserve(m, 4)
-        val attempt = outbox.beginReserved(r)
+        val attempt = outbox.beginReserved(r, m, listOf(4L))
         assertThrows(IOException::class.java) { outbox.stageReservedBody(r, 0, "body".toByteArray(), 4) }
         outbox.rollback(attempt)
         assertEquals(0L, outbox.retainedBytes())
         fail = false
-        outbox.beginReserved(r)
+        outbox.beginReserved(r, m, listOf(4L))
         outbox.stageReservedBody(r, 0, "body".toByteArray(), 4)
         outbox.publishReserved(r, m)
         assertEquals(1, root.walkTopDown().count { it.name == "child-0.json" })
@@ -183,8 +183,9 @@ class OutboxAdmissionTest {
         val outbox = ChunkOutbox(root, DurableFiles(syncDirectory = { directory ->
             if (crash && directory.name == "generation") throw ProcessDeath()
         }))
-        val r = outbox.reserve(manifest(), 4)
-        val attempt = outbox.beginReserved(r)
+        val m = manifest()
+        val r = outbox.reserve(m, 4)
+        val attempt = outbox.beginReserved(r, m, listOf(4L))
         outbox.stageReservedBody(r, 0, "body".toByteArray(), 4)
         crash = true
         assertThrows(ProcessDeath::class.java) { outbox.rollback(attempt) }
@@ -205,7 +206,7 @@ class OutboxAdmissionTest {
             val outbox = ChunkOutbox(root)
             val m = manifest().copy(phase = phase, reason = if (phase == ChunkPhase.PAUSED) ChunkReason.UNKNOWN_ACCEPTANCE else ChunkReason.NONE)
             val r = outbox.reserve(m, 4)
-            val token = outbox.beginReserved(r)
+            val token = outbox.beginReserved(r, m, listOf(4L))
             outbox.stageReservedBody(r, 0, "body".toByteArray(), 4)
             outbox.publishReserved(r, m)
             File(root, "active").delete()
@@ -215,7 +216,7 @@ class OutboxAdmissionTest {
         }
         val root = temporary.newFolder()
         val outbox = ChunkOutbox(root)
-        val token = outbox.beginReserved(outbox.reserve(manifest(), 4))
+        val token = outbox.beginReserved(outbox.reserve(manifest(), 4), manifest(), listOf(4L))
         File(root, "generation/unknown-named-file").writeText("untouched")
         val before = inventory(root)
         outbox.rollback(token)
@@ -278,7 +279,7 @@ class OutboxAdmissionTest {
         }))
         val m = manifest()
         val r = outbox.reserve(m, 4)
-        outbox.beginReserved(r)
+        outbox.beginReserved(r, m, listOf(4L))
         outbox.stageReservedBody(r, 0, "body".toByteArray(), 4)
         outbox.publishReserved(r, m)
         outbox.save(m.copy(phase = ChunkPhase.SEND))

@@ -68,9 +68,12 @@ class StagingRecoveryTest {
         val outbox = ChunkOutbox(root)
         val plan = fixture(manifest.generation).plan
         val reservation = outbox.reserve(manifest, plan.children.sumOf { it.body.size.toLong() })
-        outbox.beginReserved(reservation)
+        outbox.beginReserved(reservation, manifest, plan.children.map { it.body.size.toLong() })
         plan.children.forEachIndexed { index, child -> outbox.stageReservedBody(reservation, index, child.body, child.body.size) }
         outbox.publishReserved(reservation, manifest)
+        val dir = File(root, manifest.generation)
+        File(dir, ATTEMPT_INTENT_NAME).delete()
+        File(dir, "reservation").writeBytes(reservation.copy(peak = reservation.legacyPeak()).bytes())
         for (name in listOf("active", "active.tmp", "active-proof", "active-proof.tmp", "previous", "previous.tmp")) {
             File(root, name).delete()
         }
@@ -138,7 +141,7 @@ class StagingRecoveryTest {
                 assertEquals(before, inventory(root))
             } else {
                 assertNull("$name/$boundary", result)
-                assertFalse(File(root, "attempt").exists())
+                assertEquals(before, inventory(root))
                 assertEquals(prior, inventory(File(root, "prior")))
             }
             if (File(root, "active").readText() == "prior") assertPrior(root, prior)

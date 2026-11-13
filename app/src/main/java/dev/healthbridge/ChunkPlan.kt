@@ -2,8 +2,9 @@ package dev.healthbridge
 
 import java.security.MessageDigest
 
-internal fun sha256(bytes: ByteArray): String =
-    MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it.toInt() and 255) }
+internal fun sha256(bytes: ByteArray, size: Int = bytes.size): String =
+    MessageDigest.getInstance("SHA-256").apply { update(bytes, 0, size) }.digest()
+        .joinToString("") { "%02x".format(it.toInt() and 255) }
 
 internal data class ChunkRecord(val recordId: String, val json: String)
 internal data class ChunkLimits(val wireBytes: Long = 524_288, val count: Int = 5_000, val mappedBytes: Long = 900_000) {

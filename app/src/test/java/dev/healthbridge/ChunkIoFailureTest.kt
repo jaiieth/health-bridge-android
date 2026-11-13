@@ -270,7 +270,7 @@ class ChunkIoFailureTest {
         val source = staged()
         val manifest = source.outbox.load()!!
         val plan = ChunkPartitioner.partition(source.input.records, manifest.children.map { it.batchId }, syntheticMapping, source.limits) as ChunkPlan.Ready
-        val required = plan.children.sumOf { it.body.size.toLong() } + 3 * manifestEncodedBytes(manifest) + 256 + STAGE_HEADROOM_BYTES + 8192
+        val required = plan.children.sumOf { it.body.size.toLong() } + 3 * manifestEncodedBytes(manifest) + 256 + 2 * attemptIntentBudget(manifestEncodedBytes(manifest)) + STAGE_HEADROOM_BYTES + 8192
         listOf(required - 1, required).forEach { available ->
             val root = temporary.newFolder()
             val old = File(root, "older")

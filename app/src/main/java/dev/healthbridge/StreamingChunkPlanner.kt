@@ -52,7 +52,9 @@ internal class StreamingRetention {
  * and six type/timestamp targets of <=40 chars each. Record ID + hash string content
  * is checked BEFORE insertion at <=16564224 UTF-16 bytes. A rejected ID, if retained,
  * is separately <=2R bytes. Child IDs are <=128 chars and SHA strings are 64 chars.
- * List backing capacity is <150001 references per list; child/set capacity is <=256.
+ * Each of the two immutable intent record-list snapshots adds <=100000 references,
+ * sharing the existing string content. Planner list backing capacity is <150001
+ * references per list; child/set capacity is <=256.
  *
  * Production mapping scratch parses only the bounded incoming record. It retains
  * <=R JSON values/containers, <=R map entries and <=R logical list entries, <=R
@@ -64,6 +66,8 @@ internal class StreamingRetention {
  * scratch allowance for <=100 decimal temporaries of <=1076 digits / <=128 int
  * limbs each. This excludes arbitrary injected test mappings.
  *
+ * Intent encoding has a separate reservation-derived bound of manifest bytes +32768.
+ * Its JSON tree, encoded text, and UTF-8 bytes are bounded metadata allocations.
  * Manifest encoding is guarded before allocating JSON objects or encoded text at
  * <=8388608 UTF-8 bytes. Raw ID/hash content is <=16564224 UTF-16 bytes by default;
  * escaped strings and JSON overhead are counted separately before insertion.
@@ -71,7 +75,7 @@ internal class StreamingRetention {
  * Replay verifies child hashes and the complete manifest before publication, retaining
  * the same bounded payload buffer. Source changes fail closed. Reservation includes
  * all retained files, body bytes, two bounded manifests, two pointer copies and
- * 1024 bytes for reservation/marker metadata. It stays fixed across resume.
+ * intent metadata and its atomic-copy cost, and reservation/marker metadata. It stays fixed across resume.
  * Refusal never deletes previously retained evidence or commits cursors. These are enforced content
  * bounds, not JVM heap/RSS or allocator claims.
  * SDK record graphs/pages, page tokens and sourceName lookup allocations are outside
@@ -87,6 +91,9 @@ internal class StreamingChunkPlanner(
     private val retention: StreamingRetention = StreamingRetention(),
 ) {
     private class Refused(val blocked: ChunkPlan.Blocked) : RuntimeException()
+    private data class PlannedGeneration(val manifest: ChunkManifest, val bodyLengths: List<Long>) {
+        val bodyBytes: Long get() = bodyLengths.sum()
+    }
 
     suspend fun stage(input: FreshChunkInput, endpointHash: String): ChunkManifest {
         outbox.backpressure(limit = generationLimits.queueBytes)?.let { throw ChunkBudgetExceeded(it) }
@@ -94,17 +101,17 @@ internal class StreamingChunkPlanner(
         val ids = mutableListOf<String>()
         val now = clock()
         val planned = build(input, endpointHash, generation, now, { newId().also(ids::add) })
-        val manifest = planned.first
+        val manifest = planned.manifest
         if (manifest.reason == ChunkReason.MANIFEST_LIMIT) {
             outbox.recordBackpressure(manifest.reason, generation, Long.MAX_VALUE)
             return manifest
         }
         val reservation = try {
-            outbox.reserve(manifest, planned.second, generationLimits.queueBytes)
+            outbox.reserve(manifest, planned.bodyBytes, generationLimits.queueBytes)
         } catch (e: ChunkBudgetExceeded) {
             return manifest.copy(phase = ChunkPhase.BLOCKED, children = emptyList(), reason = e.reason)
         }
-        val attempt = outbox.beginReserved(reservation)
+        val attempt = outbox.beginReserved(reservation, manifest, planned.bodyLengths)
         try {
             if (manifest.phase != ChunkPhase.BLOCKED) {
                 var idIndex = 0
@@ -115,7 +122,7 @@ internal class StreamingChunkPlanner(
                     check(child.bodySha == hash) { "SOURCE_CHANGED" }
                     outbox.stageReservedBody(reservation, index, bytes, size)
                 }
-                check(replay.first == manifest && replay.second == planned.second) { "SOURCE_CHANGED" }
+                check(replay == planned) { "SOURCE_CHANGED" }
             }
             outbox.publishReserved(reservation, manifest)
             return manifest
@@ -130,7 +137,7 @@ internal class StreamingChunkPlanner(
         childId: () -> String,
         expected: ChunkManifest? = null,
         write: (Int, ByteArray, Int) -> Unit = { _, _, _ -> },
-    ): Pair<ChunkManifest, Long> {
+    ): PlannedGeneration {
         require(input.records.isEmpty()) { "STREAM_WITH_LIST" }
         val producer = checkNotNull(input.producer)
         require(limits.wireBytes <= FRESH_RECORD_BYTES && limits.count <= 5000 && limits.mappedBytes <= 900_000)
@@ -151,7 +158,7 @@ internal class StreamingChunkPlanner(
         var mapped = 2L
         var metadataUtf16Bytes = 0L
         var manifestBound = manifestBaseBytes(generation, endpointHash, targets) + generationLimits.children * 1024L
-        var bodyBytes = 0L
+        val bodyLengths = mutableListOf<Long>()
         var publish = true
         var limitReason: ChunkReason? = null
         val hashPlaceholder = "0".repeat(64)
@@ -175,7 +182,7 @@ internal class StreamingChunkPlanner(
             val digest = MessageDigest.getInstance("SHA-256").apply { update(buffer, 0, size) }.digest()
             val hash = digest.joinToString("") { "%02x".format(it.toInt() and 255) }
             write(children.size, buffer, size)
-            bodyBytes += size
+            bodyLengths += size.toLong()
             children += ChunkChild(children.size, batchId, hash, count)
             retention.childCount = children.size
         }
@@ -255,9 +262,9 @@ internal class StreamingChunkPlanner(
             }, blocked?.recordId, blocked?.wireBytes, blocked?.mappedBytes)
         val encodedBound = manifestEncodedBytes(manifest)
         if (!publish || encodedBound > generationLimits.manifestBytes) {
-            return manifest.copy(phase = ChunkPhase.BLOCKED, children = emptyList(), reason = ChunkReason.MANIFEST_LIMIT) to 0L
+            return PlannedGeneration(manifest.copy(phase = ChunkPhase.BLOCKED, children = emptyList(), reason = ChunkReason.MANIFEST_LIMIT), emptyList())
         }
-        return manifest to if (blocked == null) bodyBytes else 0L
+        return PlannedGeneration(manifest, if (blocked == null) bodyLengths else emptyList())
     }
 }
 

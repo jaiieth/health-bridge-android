@@ -16,7 +16,7 @@ class ManifestByteBudgetTest {
     private fun stage(root: File, input: FreshChunkInput, budget: FreshGenerationLimits = FreshGenerationLimits(), count: Int = 5000): ChunkManifest = runBlocking {
         var id = 0
         StreamingChunkPlanner(ChunkOutbox(root), syntheticMapping, ChunkLimits(count = count),
-            { "budget-${id++}" }, { 0L }, budget).stage(input, "endpoint")
+            { "budget-${id++}" }, { 0L }, budget).stage(input, sha256("endpoint".toByteArray()))
     }
 
     @Test fun escapingBoundCoversRealJsonIncludingControlsAndSurrogates() {
