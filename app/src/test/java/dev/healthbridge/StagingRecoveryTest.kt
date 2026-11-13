@@ -76,6 +76,39 @@ class StagingRecoveryTest {
         }
     }
 
+    @Test fun missingCommittedPhaseEvidenceIsRetainedCountedAndDoesNotBlockFreshStage() {
+        for (metadata in listOf(emptyList(), listOf("manifest.json.tmp"), listOf("published.json.tmp"),
+                listOf("manifest.json.tmp", "published.json.tmp"))) {
+            val root = temporary.newFolder()
+            unpublished(root)
+            val dir = File(root, "attempt")
+            val bytes = File(dir, "manifest.json").readBytes()
+            File(dir, "manifest.json").delete()
+            File(dir, "published.json").delete()
+            metadata.forEach { File(dir, it).writeBytes(bytes) }
+            val before = inventory(dir)
+            val outbox = ChunkOutbox(root)
+            val retained = dir.listFiles()!!.sumOf { it.length() }
+            assertEquals(retained, outbox.retainedBytes())
+            assertNull(outbox.recoverStaging())
+            assertEquals(before, inventory(dir))
+            assertEquals(retained, outbox.retainedBytes())
+            val fresh = fixture("fresh")
+            outbox.stage(fresh.manifest, fresh.plan)
+            assertEquals("fresh", outbox.load()!!.generation)
+            assertEquals(before, inventory(dir))
+            assertTrue(outbox.retainedBytes() > retained)
+        }
+    }
+
+    @Test fun committedPublishedStageAloneAuthorizesReclaim() {
+        val root = temporary.newFolder()
+        unpublished(root)
+        File(root, "attempt/manifest.json").delete()
+        assertNull(ChunkOutbox(root).recoverStaging())
+        assertFalse(File(root, "attempt").exists())
+    }
+
     @Test fun everyStagingAtomicBoundaryReclaimsOnlyProvenUnreferencedAttempt() {
         val names = listOf("reservation", "child-0.json", "child-1.json", "manifest.json", "published.json", "active-proof", "active")
         for (name in names) for (boundary in DurableBoundary.entries) {
@@ -92,8 +125,12 @@ class StagingRecoveryTest {
             val referenced = listOf("active", "active.tmp", "active-proof", "active-proof.tmp", "previous", "previous.tmp").any {
                 File(root, it).let { file -> file.isFile && file.readLines().any { line -> line == "attempt" } }
             }
+            val hasCommittedMetadata = File(root, "attempt/manifest.json").exists() || File(root, "attempt/published.json").exists()
             val result = ChunkOutbox(root).recoverStaging()
             if (!hasReservation) {
+                assertNull(result)
+                assertEquals(before, inventory(root))
+            } else if (!hasCommittedMetadata) {
                 assertNull(result)
                 assertEquals(before, inventory(root))
             } else if (referenced) {
@@ -158,6 +195,11 @@ class StagingRecoveryTest {
             assertThrows(boundary.name, ProcessDeath::class.java) { outbox.recoverStaging() }
             assertTrue(crashed)
             assertTrue(File(root, "staging-tombstone").exists())
+            if (boundary == ReleaseBoundary.MANIFEST_REMOVED) {
+                assertTrue(File(root, "attempt/reservation").isFile)
+                assertFalse(File(root, "attempt/manifest.json").exists())
+                assertFalse(File(root, "attempt/published.json").exists())
+            }
             assertNull(boundary.name, ChunkOutbox(root).recoverStaging())
             assertFalse(File(root, "attempt").exists())
             assertFalse(File(root, "staging-tombstone").exists())
@@ -272,10 +314,35 @@ class StagingRecoveryTest {
             unpublished(root)
             corrupt(root)
             val before = inventory(root)
-            assertEquals("corruption $index", if (index in 0..8 || index == 11) null else ChunkReason.CORRUPT_OUTBOX,
+            assertEquals("corruption $index", if (index in 0..5 || index == 11) null else ChunkReason.CORRUPT_OUTBOX,
                 ChunkOutbox(root).recoverStaging())
             assertEquals("corruption $index", before, inventory(root))
             envelope(root)
+        }
+    }
+
+    @Test fun invalidCommittedIdentityAndInventoryBlockWithoutMutations() {
+        val corruptions: List<(File) -> Unit> = listOf(
+            { root ->
+                val file = File(root, "attempt/manifest.json")
+                file.writeText(JSONObject(file.readText()).put("generation", "other").toString())
+            },
+            { root ->
+                val file = File(root, "attempt/manifest.json")
+                val json = JSONObject(file.readText())
+                json.getJSONArray("children").getJSONObject(0).put("index", 1)
+                file.writeText(json.toString())
+            },
+            { File(it, "attempt/child-0.json").appendText("changed") },
+            { File(it, "attempt/child-0.json").writeBytes(ByteArray(524_289)) },
+        )
+        for (corrupt in corruptions) {
+            val root = temporary.newFolder()
+            unpublished(root)
+            corrupt(root)
+            val before = inventory(root)
+            assertEquals(ChunkReason.CORRUPT_OUTBOX, ChunkOutbox(root).recoverStaging())
+            assertEquals(before, inventory(root))
         }
     }
 
@@ -283,6 +350,7 @@ class StagingRecoveryTest {
         val base = fixture("attempt").manifest
         val unsafe = listOf(
             base.copy(phase = ChunkPhase.SEND),
+            base.copy(phase = ChunkPhase.ACK),
             base.copy(phase = ChunkPhase.COMMIT),
             base.copy(phase = ChunkPhase.DONE),
             base.copy(reason = ChunkReason.UNKNOWN_ACCEPTANCE),
@@ -331,13 +399,12 @@ class StagingRecoveryTest {
     }
 
     @Test fun incompleteCleanupProofWithSafeMetadataDoesNotBlockNormalPlanning() {
-        for (damage in listOf("missing", "corrupt", "unknown")) {
+        for (damage in listOf("missing", "corrupt")) {
             val root = temporary.newFolder()
             unpublished(root)
             when (damage) {
                 "missing" -> File(root, "attempt/reservation").delete()
                 "corrupt" -> File(root, "attempt/reservation").writeText("invalid reservation")
-                "unknown" -> File(root, "attempt/unknown").writeText("retain")
             }
             val before = inventory(File(root, "attempt"))
             val cursors = FakeChunkCursors()

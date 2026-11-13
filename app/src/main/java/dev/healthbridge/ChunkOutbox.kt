@@ -340,7 +340,14 @@ internal class ChunkOutbox(
                 require(m.children.map { it.index } == m.children.indices.toList())
             }
         }
+        require(entries.any { it.name == "manifest.json" || it.name == "published.json" })
         require(manifests.map { it.children }.distinct().size <= 1)
+        val children = manifests.first().children
+        if (expected == null) require(children.all { File(dir, "child-${it.index}.json").isFile })
+        entries.filter { it.name.startsWith("child-") }.forEach { file ->
+            val index = file.name.substringAfter("child-").substringBefore(".").toInt()
+            require(index in children.indices && sha256(file.readBytes()) == children[index].bodySha)
+        }
         return r
     }
 
@@ -354,15 +361,29 @@ internal class ChunkOutbox(
         val metadata = listOf("manifest.json", "published.json", "manifest.json.tmp", "published.json.tmp")
             .map { File(dir, it) }.filter { Files.exists(it.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS) }
         val hasPublishedMetadata = metadata.any { it.name == "manifest.json" || it.name == "published.json" }
+        try {
+            val entries = stagingEntries(dir)
+            require(entries.all { file -> file.length() <= when {
+                file.name.startsWith("child-") -> 524_288L
+                file.name.startsWith("reservation") -> 256L
+                else -> FreshGenerationLimits().manifestBytes
+            } })
+        } catch (_: Exception) { return StagingRecovery.Block }
+        if (!hasPublishedMetadata) return StagingRecovery.Retain
         val safeMetadata = try {
-            val manifests = if (!hasPublishedMetadata) emptyList() else metadata.map { file ->
+            val manifests = metadata.map { file ->
                 require(file.isFile && !Files.isSymbolicLink(file.toPath()) && file.length() <= FreshGenerationLimits().manifestBytes)
                 decode(file.readText()).also { m ->
                     require(m.generation == dir.name && m.recordIds.size == m.recordHashes.size)
                     require(m.fingerprint == parentFingerprint(m.endpointHash, m.recordIds, m.recordHashes, m.targets))
-                    require(m.phase !in setOf(ChunkPhase.SEND, ChunkPhase.ACK, ChunkPhase.COMMIT, ChunkPhase.DONE) &&
+                    require(m.phase in setOf(ChunkPhase.STAGE, ChunkPhase.BLOCKED) &&
                         m.reason != ChunkReason.UNKNOWN_ACCEPTANCE)
                     require(m.children.none { it.acked || it.sentAt != null || it.ackedAt != null })
+                    require(m.children.map { it.index } == m.children.indices.toList())
+                    stagingEntries(dir).filter { it.name.startsWith("child-") }.forEach { body ->
+                        val index = body.name.substringAfter("child-").substringBefore(".").toInt()
+                        require(index in m.children.indices && sha256(body.readBytes()) == m.children[index].bodySha)
+                    }
                 }
             }
             manifests.map { it.children }.distinct().size <= 1
@@ -483,7 +504,14 @@ internal class ChunkOutbox(
                     Files.deleteIfExists(tombstone.toPath())
                     files.sync(root)
                 } else {
-                    stagingEvidence(dir, recorded.reservation)
+                    val remaining = stagingEntries(dir)
+                    if (remaining.any { it.name == "manifest.json" || it.name == "published.json" }) {
+                        stagingEvidence(dir, recorded.reservation)
+                    } else {
+                        // Only a durable tombstone and its inventory digest can resume after phase metadata removal.
+                        require(tombstone.exists() && remaining.all { it.name == "reservation" })
+                        remaining.forEach { require(readReservation(it, dir.name) == recorded.reservation) }
+                    }
                     val digest = inventoryDigest(dir)
                     require(digest == recorded.before || digest == recorded.after)
                     if (!tombstone.exists()) {

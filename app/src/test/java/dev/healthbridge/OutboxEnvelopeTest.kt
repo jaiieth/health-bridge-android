@@ -72,6 +72,92 @@ class OutboxEnvelopeTest {
         assertTrue(total(root) <= OUTBOX_HARD_QUOTA_BYTES)
     }
 
+    @Test fun nearHardQuotaMeasuresEveryAtomicCopyAndStagingDeletion() {
+        val root = temporary.newFolder()
+        data class Peak(val bytes: Long, val atMillis: Long, val file: String)
+        val peaks = sortedMapOf<String, Peak>()
+        var operation = "retained-stage"
+        var admittedPeak = OUTBOX_HARD_QUOTA_BYTES
+        fun observe(boundary: String, file: String) {
+            val bytes = total(root)
+            val atMillis = System.currentTimeMillis()
+            val key = "$operation/${if (file.startsWith("child-")) "child" else file}/$boundary"
+            if (bytes > (peaks[key]?.bytes ?: -1)) peaks[key] = Peak(bytes, atMillis, file)
+            val message = "$key total=$bytes peak=$admittedPeak atMillis=$atMillis maxima=$peaks"
+            assertTrue(message, bytes <= OUTBOX_HARD_QUOTA_BYTES)
+            assertTrue(message, bytes <= admittedPeak)
+        }
+        val outbox = ChunkOutbox(root, DurableFiles(fault = { boundary, file -> observe(boundary.name, file) }),
+            releaseFault = { boundary, file -> observe(boundary.name, file) })
+        fun fixture(id: String, count: Int, lastSize: Int = 524_288): Pair<ChunkManifest, List<ByteArray>> {
+            val records = List(count) { index ->
+                val recordId = "$id-record-$index"
+                val empty = syntheticRecord(recordId, "")
+                val overhead = ChunkPartitioner.envelope("$id-batch-$index", listOf(empty)).size
+                syntheticRecord(recordId, "x".repeat((if (index == count - 1) lastSize else 524_288) - overhead))
+            }
+            val bodies = records.mapIndexed { index, record ->
+                ChunkPartitioner.envelope("$id-batch-$index", listOf(record)).also { assertEquals(if (index == count - 1) lastSize else 524_288, it.size) }
+            }
+            val endpoint = sha256("endpoint".toByteArray())
+            val ids = records.map { it.recordId }
+            val hashes = records.map { sha256(it.json.toByteArray()) }
+            val targets = mapOf("StepsRecord" to "2026-11-01T00:00:00Z")
+            val manifest = ChunkManifest(id, parentFingerprint(endpoint, ids, hashes, targets), endpoint,
+                ids, hashes, targets, 0, 0, ChunkPhase.STAGE,
+                bodies.mapIndexed { index, body -> ChunkChild(index, "$id-batch-$index", sha256(body), 1) })
+            return manifest to bodies
+        }
+        fun stage(m: ChunkManifest, bodies: List<ByteArray>, destination: ChunkOutbox = outbox): ChunkOutbox.Reservation {
+            val reservation = destination.reserve(m, bodies.sumOf { it.size.toLong() })
+            if (destination === outbox) admittedPeak = reservation.peak
+            destination.beginReserved(reservation)
+            bodies.forEachIndexed { index, body -> destination.stageReservedBody(reservation, index, body, body.size) }
+            destination.publishReserved(reservation, m)
+            return reservation
+        }
+        fun done(m: ChunkManifest) = m.copy(phase = ChunkPhase.DONE,
+            children = m.children.map { it.copy(acked = true, sentAt = 1, ackedAt = 1) })
+        val (attempt, bodies) = fixture("near-limit", 100)
+        val probeRoot = temporary.newFolder()
+        val probe = ChunkOutbox(probeRoot)
+        val (probeManifest, probeBodies) = fixture("retained", 28)
+        stage(probeManifest, probeBodies, probe)
+        probe.save(done(probeManifest))
+        val retainedMetadata = probe.retainedBytes() - probeBodies.sumOf { it.size.toLong() }
+        val retainedBodyBudget = OUTBOX_HARD_QUOTA_BYTES - OUTBOX_CONTROL_RESERVE_BYTES -
+            bodies.sumOf { it.size.toLong() } - 3 * manifestEncodedBytes(attempt) - 256 - retainedMetadata
+        val lastSize = (retainedBodyBudget - 27L * 524_288).toInt()
+        assertTrue(lastSize in 1024..524_288)
+        val (retained, retainedBodies) = fixture("retained", 28, lastSize)
+        stage(retained, retainedBodies)
+        operation = "retained-save-done"
+        outbox.save(done(retained))
+        File(root, "previous").writeBytes(File(root, "active-proof").readBytes())
+        operation = "near-limit-stage"
+        val reservation = stage(attempt, bodies)
+        assertEquals(OUTBOX_HARD_QUOTA_BYTES - OUTBOX_CONTROL_RESERVE_BYTES + reservation.controls, reservation.peak)
+        assertEquals(52_428_800L, reservation.bodies)
+        operation = "near-limit-save"
+        outbox.save(attempt.copy(updatedAt = 1))
+        operation = "backpressure"
+        outbox.recordBackpressure(ChunkReason.OUTBOX_QUOTA, "refused", OUTBOX_HARD_QUOTA_BYTES + 1)
+        for (name in listOf("active", "active-proof")) assertTrue(File(root, name).delete())
+        operation = "staging-delete"
+        assertNull(outbox.recoverStaging())
+        assertFalse(File(root, attempt.generation).exists())
+        assertTrue(File(root, retained.generation).isDirectory)
+        val requiredWrites = listOf("near-limit-stage/reservation", "near-limit-stage/child",
+            "near-limit-stage/manifest.json", "near-limit-stage/published.json", "near-limit-stage/previous",
+            "near-limit-stage/active-proof", "near-limit-stage/active", "near-limit-save/manifest.json",
+            "backpressure/backpressure", "staging-delete/staging-tombstone")
+        for (write in requiredWrites) for (boundary in DurableBoundary.entries) {
+            assertNotNull("$write/$boundary", peaks["$write/$boundary"])
+        }
+        assertNotNull(peaks["staging-delete/near-limit/BODY_REMOVED"])
+        peaks.forEach { (key, value) -> println("OUTBOX_PEAK $key total=${value.bytes} atMillis=${value.atMillis} file=${value.file} reservationPeak=${reservation.peak}") }
+    }
+
     @Test fun oldAndUnknownMarkerFormatsAreBlockedReadOnlyEvenOnExplicitRetry() {
         for (version in listOf("1", "999")) {
             val root = temporary.newFolder()
