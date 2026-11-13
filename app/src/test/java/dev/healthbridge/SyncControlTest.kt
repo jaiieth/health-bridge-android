@@ -60,10 +60,18 @@ class SyncControlTest {
         assertEquals(listOf("cancel"), fixture.calls)
     }
 
-    @Test fun saveWhileOnUpdatesStoredIntervalWithoutSchedulingOrCanceling() {
+    @Test fun saveWhileOnWithChangedIntervalSchedulesNewIntervalWithoutCanceling() {
         val fixture = Fixture(true)
         fixture.control.save("https://example.invalid/hook", "key", 120)
         assertEquals(120L, fixture.values["minutes"])
+        assertEquals(true, fixture.values["sync_enabled"])
+        assertEquals(listOf("schedule:120"), fixture.calls)
+    }
+
+    @Test fun saveWhileOnWithUnchangedIntervalDoesNoWork() {
+        val fixture = Fixture(true)
+        fixture.control.save("https://example.invalid/hook", "key", 75)
+        assertEquals(75L, fixture.values["minutes"])
         assertEquals(true, fixture.values["sync_enabled"])
         assertEquals(emptyList<String>(), fixture.calls)
     }
