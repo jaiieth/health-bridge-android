@@ -9,6 +9,134 @@ class SyncStatusDisplayTest {
     private fun snapshot(enabled: Boolean = true, result: String = "Ready") =
         SyncStatusDisplay.Snapshot(enabled, true, true, result)
 
+    @Test fun recordedChunkStatusesAreRecognized() {
+        data class Case(val phase: String, val reason: String, val state: SyncStatusDisplay.State, val label: String)
+        val cases = listOf(
+            Case("PLAN", "FLAG_OFF", SyncStatusDisplay.State.OFF, "OFF"),
+            Case("DONE", "NONE", SyncStatusDisplay.State.DONE, "Acknowledged"),
+            Case("PAUSED", "IO_FAILURE", SyncStatusDisplay.State.IO_FAILURE, "Storage failure"),
+        ) + listOf("LEGACY_PENDING", "HTTP_400", "HTTP_409", "HTTP_413", "HTTP_BLOCKED", "OVERSIZED", "INVALID_TIMESTAMP").map {
+            Case("BLOCKED", it, SyncStatusDisplay.State.BLOCKED, "Blocked")
+        } + listOf("CORRUPT_OUTBOX", "UNKNOWN_ACCEPTANCE", "ENDPOINT_CHANGED", "HTTP_RETRY", "INVALID_ACK").map {
+            Case("PAUSED", it, SyncStatusDisplay.State.PAUSED, "Paused")
+        } + listOf("PLAN", "STAGE", "SEND", "ACK", "COMMIT").map {
+            Case(it, "NONE", SyncStatusDisplay.State.PARTIAL, "In progress / partial")
+        }
+        cases.forEach { c ->
+            val display = SyncStatusDisplay.format(snapshot(result = "Health sync ${c.phase}: 1/1; ${c.reason}"))
+            assertEquals(c.toString(), c.state, display.state)
+            assertEquals(c.toString(), c.label, display.state.label)
+            if (c.phase in listOf("PAUSED", "BLOCKED")) assertTrue(display.action.contains("No automatic resend"))
+        }
+        assertEquals(ChunkPhase.entries.map { it.name }.toSet(), cases.map { it.phase }.toSet())
+        assertEquals(ChunkReason.entries.map { it.name }.toSet(), cases.map { it.reason }.toSet())
+    }
+
+    @Test fun progressUsesFirstUnacknowledgedIndexAndPreservesFinalUncertainty() {
+        assertEquals("0 of 0 chunks are recorded. Health sync is incomplete. Automatic sync was off when this result was recorded. No automatic resend will run.",
+            SyncStatusDisplay.progress("Health sync PLAN: 0/0; FLAG_OFF"))
+        assertEquals("1 of 1 chunks have recorded acknowledgements. Health sync completion is recorded.",
+            SyncStatusDisplay.progress("Health sync DONE: 1/1; NONE"))
+        assertEquals("0 of 0 chunks have recorded acknowledgements. Health sync completion is recorded.",
+            SyncStatusDisplay.progress("Health sync DONE: 0/0; NONE"))
+        assertEquals("1 of 3 chunks have recorded acknowledgements. 2 chunks are unacknowledged. Health sync is incomplete. Receiver acceptance is unknown. Check the receiver before any resend. No automatic resend will run.",
+            SyncStatusDisplay.progress("Health sync PAUSED: 2/3; UNKNOWN_ACCEPTANCE"))
+        assertEquals("0 to 1 of 1 chunks have recorded acknowledgements. 0 to 1 chunks are unacknowledged; the stored result cannot resolve the final acknowledgement. Health sync is incomplete. The receiver acknowledgement was invalid. Acceptance is not confirmed. No automatic resend will run.",
+            SyncStatusDisplay.progress("Health sync PAUSED: 1/1; INVALID_ACK"))
+        assertEquals("Chunk counts are unavailable after a storage failure. Health sync is incomplete. Local storage failed. Recorded counts may be unavailable. No automatic resend will run.",
+            SyncStatusDisplay.progress("Health sync PAUSED: 0/0; IO_FAILURE"))
+        assertEquals("3 of 3 chunks have recorded acknowledgements. Cursor commit is not confirmed. Health sync is incomplete.",
+            SyncStatusDisplay.progress("Health sync COMMIT: 3/3; NONE"))
+        val blocked = SyncStatusDisplay.progress("Health sync BLOCKED: 2/5; LEGACY_PENDING")
+        assertTrue(blocked.contains("1 of 5 chunks"))
+        assertTrue(blocked.contains("4 chunks are unacknowledged"))
+        assertTrue(blocked.contains("legacy Pending"))
+        assertTrue(blocked.contains("No automatic resend"))
+    }
+
+    @Test fun onlyDoneClaimsCompletionRegardlessOfStoredSuccessTime() {
+        (ChunkPhase.entries.map { "Health sync $it: 1/1; NONE" } + "unrecognized").forEach { result ->
+            val display = SyncStatusDisplay.format(snapshot(result = result).copy(lastSuccess = "2026-01-01T00:00:00Z"))
+            val isDone = result == "Health sync DONE: 1/1; NONE"
+            assertEquals(result, isDone, display.state == SyncStatusDisplay.State.DONE)
+            assertEquals(result, isDone, display.reason.contains("acknowledgement and cursor commit are recorded"))
+            assertEquals(result, isDone, SyncStatusDisplay.progress(result).contains("completion is recorded"))
+        }
+    }
+
+    @Test fun retainedLegacyPendingIsExplicitWithoutInventedCounts() {
+        val result = "Health sync PAUSED: legacy Pending preserved; delivery blocked"
+        val display = SyncStatusDisplay.format(snapshot(result = result))
+        assertEquals(SyncStatusDisplay.State.BLOCKED, display.state)
+        assertEquals("Blocked", display.state.label)
+        assertEquals("A retained legacy Pending batch blocks health delivery.", display.reason)
+        assertFalse(SyncStatusDisplay.progress(result).contains("of 0"))
+    }
+
+    @Test fun malformedOrInjectedRecordsStayUnknownAndNeverEchoInput() {
+        listOf(
+            "Health sync DONE: 1/1; NONE secret-token",
+            "Health sync PAUSED: 1/1; https://secret.invalid/token",
+            "Health sync MADE_UP: 1/1; NONE", "Health sync PAUSED: 1/1; SECRET",
+            "Health sync DONE: 0/1; NONE", "Health sync ACK: 2/1; NONE",
+            "Health sync ACK: -1/1; NONE", "Health sync ACK: 1/0; NONE",
+            "Health sync ACK: 999999999999/999999999999; NONE",
+            "Health sync DONE: 1/1; HTTP_RETRY", "Health sync DONE: 1/1; NONE\n",
+        ).forEach {
+            val display = SyncStatusDisplay.format(snapshot(result = it))
+            assertEquals(it, SyncStatusDisplay.State.UNKNOWN, display.state)
+            assertEquals("No recognized health delivery progress is recorded.", SyncStatusDisplay.progress(it))
+            assertFalse(display.toString().contains("secret", ignoreCase = true))
+        }
+    }
+
+    @Test fun reasonsAreExplicitAndSuccessTimeIsIndependentOfResult() {
+        val reasons = mapOf(
+            "NONE" to "No stop reason was recorded.",
+            "FLAG_OFF" to "Automatic sync was off when this result was recorded.",
+            "LEGACY_PENDING" to "A legacy Pending batch requires review before health sync can continue.",
+            "INVALID_TIMESTAMP" to "A record has an invalid timestamp.",
+            "UNKNOWN_ACCEPTANCE" to "Receiver acceptance is unknown. Check the receiver before any resend.",
+            "INVALID_ACK" to "The receiver acknowledgement was invalid. Acceptance is not confirmed.",
+            "HTTP_400" to "The receiver rejected the request with HTTP 400.",
+            "HTTP_409" to "The receiver reported a conflict with HTTP 409.",
+            "HTTP_413" to "The receiver rejected the request size with HTTP 413.",
+            "HTTP_BLOCKED" to "The receiver blocked the request.",
+            "HTTP_RETRY" to "The receiver returned a retryable response.",
+            "IO_FAILURE" to "Local storage failed. Recorded counts may be unavailable.",
+            "CORRUPT_OUTBOX" to "The retained outbox could not be read safely.",
+            "ENDPOINT_CHANGED" to "The endpoint differs from the retained batch destination.",
+            "OVERSIZED" to "A record exceeds the delivery size limit.",
+        )
+        assertEquals(ChunkReason.entries.map { it.name }.toSet(), reasons.keys)
+        reasons.forEach { (reason, expected) ->
+            val s = snapshot(result = "Health sync PAUSED: 1/1; $reason")
+            assertEquals("Health sync is incomplete. $expected", SyncStatusDisplay.format(s).reason)
+            assertEquals("Never recorded", SyncStatusDisplay.lastSuccess(s.lastSuccess, Instant.EPOCH, ZoneId.of("UTC")))
+        }
+        val done = snapshot(result = "Health sync DONE: 1/1; NONE")
+        assertEquals("Never recorded", SyncStatusDisplay.lastSuccess(done.lastSuccess, Instant.EPOCH, ZoneId.of("UTC")))
+    }
+
+    @Test fun containmentProducerResultsKeepTheirLabels() {
+        val cases = listOf(
+            Triple("Ready", SyncStatusDisplay.State.WAITING, "ON, waiting / paused"),
+            Triple("Sync OFF", SyncStatusDisplay.State.WAITING, "ON, waiting / paused"),
+            Triple("Health sync PAUSED: containment stage", SyncStatusDisplay.State.PAUSED, "Paused"),
+            Triple("Health sync PAUSED: legacy Pending preserved; delivery blocked", SyncStatusDisplay.State.BLOCKED, "Blocked"),
+            Triple("BLOCKED: empty Test acceptance unknown; no automatic retry", SyncStatusDisplay.State.BLOCKED, "Blocked"),
+            Triple("Empty webhook test: RETRY; request not sent; no automatic retry", SyncStatusDisplay.State.WAITING, "ON, waiting / paused"),
+        ) + (listOf(0) + (100..599)).map { code ->
+            val delivery = when (code) { in 200..299 -> "ACCEPTED"; 0, 408, 425, 429, in 500..599 -> "RETRY"; else -> "BLOCKED" }
+            Triple("Empty webhook test: $delivery HTTP $code; one shot, no automatic retry", SyncStatusDisplay.State.WAITING, "ON, waiting / paused")
+        }
+        cases.forEach { (result, state, label) ->
+            val display = SyncStatusDisplay.format(snapshot(result = result))
+            assertEquals(result, state, display.state)
+            assertEquals(result, label, display.state.label)
+        }
+    }
+
     @Test fun offOverridesStaleHealthSuccess() {
         val display = SyncStatusDisplay.format(snapshot(false, "Sync delivered: HTTP 204"))
         assertEquals(SyncStatusDisplay.State.OFF, display.state)

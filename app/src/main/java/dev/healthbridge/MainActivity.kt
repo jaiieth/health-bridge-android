@@ -22,6 +22,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
+    private lateinit var progress: TextView
     private lateinit var status: TextView
     private lateinit var stateIcon: ImageView
     private lateinit var lastSync: TextView
@@ -100,7 +101,7 @@ class MainActivity : ComponentActivity() {
         }
         syncNow.isEnabled = enabled
         text(sync, "Progress", bold = true)
-        text(sync, SyncStatusDisplay.progress())
+        progress = text(sync, SyncStatusDisplay.progress())
         text(sync, "Last successful health sync", bold = true)
         lastSync = text(sync, "Never recorded")
 
@@ -248,6 +249,8 @@ class MainActivity : ComponentActivity() {
                 val stateColor = color(when (display.state) {
                     SyncStatusDisplay.State.OFF -> R.color.hb_off
                     SyncStatusDisplay.State.BLOCKED -> R.color.hb_blocked
+                    SyncStatusDisplay.State.DONE, SyncStatusDisplay.State.PARTIAL -> R.color.hb_waiting
+                    SyncStatusDisplay.State.IO_FAILURE -> R.color.hb_blocked
                     SyncStatusDisplay.State.PAUSED -> R.color.hb_paused
                     SyncStatusDisplay.State.WAITING -> R.color.hb_waiting
                     SyncStatusDisplay.State.UNKNOWN -> R.color.hb_unknown
@@ -257,6 +260,8 @@ class MainActivity : ComponentActivity() {
                 stateIcon.setImageResource(when (display.state) {
                     SyncStatusDisplay.State.OFF -> R.drawable.ic_stop
                     SyncStatusDisplay.State.BLOCKED -> R.drawable.ic_warning
+                    SyncStatusDisplay.State.DONE, SyncStatusDisplay.State.PARTIAL -> R.drawable.ic_clock
+                    SyncStatusDisplay.State.IO_FAILURE -> R.drawable.ic_warning
                     SyncStatusDisplay.State.PAUSED -> R.drawable.ic_pause
                     SyncStatusDisplay.State.WAITING -> R.drawable.ic_clock
                     SyncStatusDisplay.State.UNKNOWN -> R.drawable.ic_help
@@ -269,6 +274,7 @@ class MainActivity : ComponentActivity() {
                 syncNow.isEnabled = s.enabled && s.configured && s.permissions
                 sendTest.isEnabled = s.configured
                 testStatus.accessibilityLiveRegion = if (s.result.startsWith("BLOCKED:") || s.result.contains(": RETRY") || s.result.contains(": BLOCKED")) View.ACCESSIBILITY_LIVE_REGION_ASSERTIVE else View.ACCESSIBILITY_LIVE_REGION_POLITE
+                progress.text = SyncStatusDisplay.progress(s.result)
                 testStatus.text = SyncStatusDisplay.testResult(s.result)
                 syncNow.text = if (syncNow.isEnabled) "Record paused health status" else "Health work unavailable: check switch, setup and access"
                 sendTest.text = if (sendTest.isEnabled) "Send test" else "Send test unavailable: save endpoint and token"
