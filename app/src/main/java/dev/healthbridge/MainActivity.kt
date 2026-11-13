@@ -40,6 +40,8 @@ class MainActivity : ComponentActivity() {
     private var changingControl = false
     private var refreshing = false
     private var startupContainmentComplete = false
+    private val diagnosticSeparator = "\n\n"
+    private val statusSeparator = "\n"
     private val enabled get() = Settings(this).syncEnabled
     private val syncControl by lazy {
         SyncControl(Settings(this), object : SyncScheduler {
@@ -107,6 +109,11 @@ class MainActivity : ComponentActivity() {
         if (!initial.freshChunkingEnabled) syncNow.text = SyncStatusDisplay.buildUnavailableReason
         text(sync, "Progress", bold = true)
         progress = text(sync, SyncStatusDisplay.progress())
+        button(sync, "Copy status details") {
+            val details = status.text.toString() + statusSeparator + progress.text.toString()
+            getSystemService(android.content.ClipboardManager::class.java)?.setPrimaryClip(
+                android.content.ClipData.newPlainText("Health Bridge status", details))
+        }
         text(sync, "Last successful health sync", bold = true)
         lastSync = text(sync, "Never recorded")
 
@@ -257,6 +264,7 @@ class MainActivity : ComponentActivity() {
                         SyncStatusDisplay.host(settings.endpoint) to settings.token.isNotBlank())
                 }
                 val s = snapshot.first
+                val diagnostic = withContext(Dispatchers.IO) { Settings(this@MainActivity).diagnostics }
                 val display = SyncStatusDisplay.format(s)
                 val controls = SyncStatusDisplay.controls(s)
                 val stateColor = color(when (display.state) {
@@ -291,7 +299,8 @@ class MainActivity : ComponentActivity() {
                 syncNow.isEnabled = controls.manualEnabled
                 sendTest.isEnabled = controls.testEnabled
                 testStatus.accessibilityLiveRegion = if (s.result.startsWith("BLOCKED:") || s.result.contains(": RETRY") || s.result.contains(": BLOCKED")) View.ACCESSIBILITY_LIVE_REGION_ASSERTIVE else View.ACCESSIBILITY_LIVE_REGION_POLITE
-                progress.text = SyncStatusDisplay.progress(s.result)
+                progress.text = SyncStatusDisplay.progress(s.result) +
+                    (diagnostic?.let { diagnosticSeparator + "Last failure detail: " + it } ?: "")
                 testStatus.text = SyncStatusDisplay.testResult(s.result)
                 syncNow.text = if (!s.freshChunkingEnabled) SyncStatusDisplay.buildUnavailableReason
                 else if (syncNow.isEnabled) "Record paused health status" else "Health work unavailable: check switch, setup and access"

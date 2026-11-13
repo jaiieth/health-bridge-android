@@ -88,6 +88,11 @@ class Settings(private val prefs: SharedPreferences) : SyncSettings {
     val minutes
         get() = prefs.getLong("minutes", 360)
 
+    /** Last failure detail for display only: cause code, failing step and sanitized error. */
+    var diagnostics: String?
+        get() = prefs.getString("last_diagnostics", null)
+        set(value) { prefs.edit().putString("last_diagnostics", value).apply() }
+
     override var syncEnabled: Boolean
         get() = prefs.getBoolean("sync_enabled", false)
         set(value) {

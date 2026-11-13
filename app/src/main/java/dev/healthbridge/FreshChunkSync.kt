@@ -1,6 +1,7 @@
 package dev.healthbridge
 
 import android.content.Context
+import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
 import java.io.File
@@ -8,11 +9,26 @@ import java.time.Instant
 
 internal fun chunkOutbox(context: Context): ChunkOutbox = ChunkOutbox(
     File(context.filesDir, "fresh-sync-chunks"),
-    DurableFiles(syncDirectory = { directory ->
-        val fd = Os.open(directory.absolutePath, OsConstants.O_RDONLY, 0)
-        try { Os.fsync(fd) } finally { Os.close(fd) }
-    }),
+    DurableFiles(syncDirectory = { directory -> syncDirectoryDurably(directory) }),
 )
+
+/**
+ * Durability fence for the outbox directory. Files are still written as temp + atomic rename.
+ * A device that rejects fsync on a directory handle keeps syncing with reduced durability and a
+ * recorded signal instead of failing every sync with a storage error.
+ */
+private fun syncDirectoryDurably(directory: File) {
+    if (DirectoryDurability.degraded) return
+    val fd = Os.open(directory.absolutePath, OsConstants.O_RDONLY, 0)
+    try {
+        Os.fsync(fd)
+    } catch (e: ErrnoException) {
+        if (!DirectoryDurability.isUnsupportedErrno(e.errno)) throw e
+        DirectoryDurability.degrade(e.errno)
+    } finally {
+        runCatching { Os.close(fd) }
+    }
+}
 
 internal suspend fun runFreshChunkSync(context: Context, store: Store, settings: Settings): ChunkStatus {
     val cursorStore = object : ChunkCursorStore {
@@ -43,5 +59,9 @@ internal suspend fun runFreshChunkSync(context: Context, store: Store, settings:
         lastSuccess = if (result.phase == ChunkPhase.DONE) Instant.now().toString() else old.lastSuccess,
         result = "Health sync ${result.phase}: ${result.index}/${result.total}; ${result.reason}",
     ))
+    val failure = SyncDiagnostics.last()
+    val reduced = DirectoryDurability.signal?.let { "durability reduced: $it" }
+    settings.diagnostics = if (result.phase == ChunkPhase.DONE) null
+        else listOfNotNull(failure, reduced).distinct().joinToString(" | ").ifEmpty { null }
     return result
 }

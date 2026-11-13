@@ -39,6 +39,7 @@ internal class ChunkSync(
         mapping: VerifiedReceiverMapping,
         collect: suspend () -> FreshChunkInput,
     ): ChunkStatus {
+        SyncDiagnostics.begin()
         if (!enabled) return ChunkStatus(ChunkPhase.PLAN, reason = ChunkReason.FLAG_OFF)
         if (cursors.hasLegacyPending()) return ChunkStatus(ChunkPhase.BLOCKED, reason = ChunkReason.LEGACY_PENDING)
         outbox.recoverStaging()?.let {
@@ -46,12 +47,15 @@ internal class ChunkSync(
         }
         try { outbox.reclaimDone(cursors) } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            SyncDiagnostics.record(e, "reclaim")
             return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE)
         }
-        var manifest = try { outbox.load()?.takeUnless { it.phase == ChunkPhase.DONE } } catch (_: IOException) {
+        var manifest = try { outbox.load()?.takeUnless { it.phase == ChunkPhase.DONE } } catch (e: IOException) {
+            SyncDiagnostics.record(e, "load")
             return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            SyncDiagnostics.record(e, "load-parse")
             return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.CORRUPT_OUTBOX)
         }
         val endpointHash = sha256(endpoint.toByteArray(Charsets.UTF_8))
@@ -59,12 +63,13 @@ internal class ChunkSync(
             if (manifest.phase == ChunkPhase.PAUSED || manifest.phase == ChunkPhase.BLOCKED) return manifest.status()
             if (manifest.phase == ChunkPhase.SEND) return stop(manifest, ChunkPhase.PAUSED, ChunkReason.UNKNOWN_ACCEPTANCE)
             if (manifest.endpointHash != endpointHash) return stop(manifest, ChunkPhase.PAUSED, ChunkReason.ENDPOINT_CHANGED)
-            try { outbox.resume(manifest) } catch (_: Exception) {
+            try { outbox.resume(manifest) } catch (e: Exception) {
+                SyncDiagnostics.record(e, "resume")
                 return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE)
             }
         } else {
             try { outbox.backpressure()?.let { return ChunkStatus(ChunkPhase.BLOCKED, reason = it) } }
-            catch (_: Exception) { return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE) }
+            catch (e: Exception) { SyncDiagnostics.record(e, "backpressure"); return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE) }
             val input = collect()
             if (input.producer != null) {
                 manifest = try {
@@ -73,7 +78,8 @@ internal class ChunkSync(
                     return ChunkStatus(ChunkPhase.BLOCKED, reason = e.reason)
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     throw e
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    SyncDiagnostics.record(e, "stage-stream")
                     return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE)
                 }
                 if (manifest.phase == ChunkPhase.BLOCKED) return manifest.status()
@@ -99,7 +105,8 @@ internal class ChunkSync(
                     }, blocked?.recordId, blocked?.wireBytes, blocked?.mappedBytes)
                 try { outbox.stage(manifest, plan as? ChunkPlan.Ready) } catch (e: ChunkBudgetExceeded) {
                     return ChunkStatus(ChunkPhase.BLOCKED, reason = e.reason)
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    SyncDiagnostics.record(e, "stage")
                     return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE)
                 }
                 if (blocked != null) return manifest.status()
@@ -148,14 +155,18 @@ internal class ChunkSync(
             return current.status()
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            SyncDiagnostics.record(e, "send")
             return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE)
         }
     }
 
     private fun stop(manifest: ChunkManifest, phase: ChunkPhase, reason: ChunkReason): ChunkStatus {
         val stopped = manifest.copy(phase = phase, reason = reason, updatedAt = clock())
-        return try { outbox.save(stopped); stopped.status() } catch (_: Exception) { ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE) }
+        return try { outbox.save(stopped); stopped.status() } catch (e: Exception) {
+            SyncDiagnostics.record(e, "save")
+            ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE)
+        }
     }
 }
 
