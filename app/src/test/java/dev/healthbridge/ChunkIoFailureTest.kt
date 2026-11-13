@@ -206,8 +206,8 @@ class ChunkIoFailureTest {
         val runner = ChunkSync(outbox, FakeChunkCursors(), send = { _, _ -> error("No send") })
         val before = snapshot(root)
         val status = runBlocking { runner.run(true, "synthetic", syntheticMapping) { error("No collection") } }
-        assertEquals(ChunkPhase.PAUSED, status.phase)
-        assertEquals(ChunkReason.IO_FAILURE, status.reason)
+        assertEquals(ChunkPhase.BLOCKED, status.phase)
+        assertEquals(ChunkReason.CORRUPT_OUTBOX, status.reason)
         assertEquals(ChunkReason.IO_FAILURE, outbox.status()!!.reason)
         assertEquals(before, snapshot(root))
 

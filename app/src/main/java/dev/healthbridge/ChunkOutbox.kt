@@ -344,6 +344,35 @@ internal class ChunkOutbox(
         return r
     }
 
+    private sealed interface StagingRecovery {
+        data class Reclaim(val reservation: Reservation) : StagingRecovery
+        data object Retain : StagingRecovery
+        data object Block : StagingRecovery
+    }
+
+    private fun classifyStaging(dir: File): StagingRecovery {
+        val metadata = listOf("manifest.json", "published.json", "manifest.json.tmp", "published.json.tmp")
+            .map { File(dir, it) }.filter { Files.exists(it.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS) }
+        val hasPublishedMetadata = metadata.any { it.name == "manifest.json" || it.name == "published.json" }
+        val safeMetadata = try {
+            val manifests = if (!hasPublishedMetadata) emptyList() else metadata.map { file ->
+                require(file.isFile && !Files.isSymbolicLink(file.toPath()) && file.length() <= FreshGenerationLimits().manifestBytes)
+                decode(file.readText()).also { m ->
+                    require(m.generation == dir.name && m.recordIds.size == m.recordHashes.size)
+                    require(m.fingerprint == parentFingerprint(m.endpointHash, m.recordIds, m.recordHashes, m.targets))
+                    require(m.phase !in setOf(ChunkPhase.SEND, ChunkPhase.ACK, ChunkPhase.COMMIT, ChunkPhase.DONE) &&
+                        m.reason != ChunkReason.UNKNOWN_ACCEPTANCE)
+                    require(m.children.none { it.acked || it.sentAt != null || it.ackedAt != null })
+                }
+            }
+            manifests.map { it.children }.distinct().size <= 1
+        } catch (_: Exception) { false }
+        if (!safeMetadata) return StagingRecovery.Block
+        if (receiptFile(dir.name).exists()) return StagingRecovery.Retain
+        return try { StagingRecovery.Reclaim(stagingEvidence(dir)) }
+        catch (_: Exception) { StagingRecovery.Retain }
+    }
+
     private fun inventoryDigest(dir: File, omit: String? = null): String {
         val digest = MessageDigest.getInstance("SHA-256")
         val buffer = ByteArray(8192)
@@ -413,7 +442,8 @@ internal class ChunkOutbox(
         if (File(root, "backpressure").exists() && backpressure(allowRetry = false) == ChunkReason.CORRUPT_OUTBOX) ChunkReason.CORRUPT_OUTBOX
         else if (!root.exists()) null else {
             require(root.isDirectory && !Files.isSymbolicLink(root.toPath()))
-            val references = recoveryReferences()
+            val references = try { recoveryReferences() }
+                catch (_: IOException) { error("UNREADABLE_POINTER") }
             val tombstone = File(root, "staging-tombstone")
             val temporary = File(root, "staging-tombstone.tmp")
             val recorded = when {
@@ -431,16 +461,18 @@ internal class ChunkOutbox(
             for (entry in entries) {
                 require(!Files.isSymbolicLink(entry.toPath()))
                 if (!entry.isDirectory) continue
-                generation(entry.name)
                 if (entry.name in references) continue
-                if (receiptFile(entry.name).exists()) {
-                    require(readReceipt(receiptFile(entry.name)) != null)
-                    continue
-                }
+                if (receiptFile(entry.name).let { it.exists() && readReceipt(it) != null }) continue
                 if (recorded?.reservation?.generation == entry.name) continue
                 if (completedManifest(entry) != null) continue
-                val r = stagingEvidence(entry)
-                if (candidate == null) { candidate = entry; reservation = r }
+                when (val decision = classifyStaging(entry)) {
+                    is StagingRecovery.Reclaim -> if (candidate == null) {
+                        candidate = entry
+                        reservation = decision.reservation
+                    }
+                    StagingRecovery.Retain -> Unit
+                    StagingRecovery.Block -> error("AMBIGUOUS_DELIVERY")
+                }
             }
             if (recorded != null) {
                 require(recorded.reservation.generation !in references && !receiptFile(recorded.reservation.generation).exists())

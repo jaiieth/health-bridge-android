@@ -94,7 +94,7 @@ class StagingRecoveryTest {
             }
             val result = ChunkOutbox(root).recoverStaging()
             if (!hasReservation) {
-                assertEquals(ChunkReason.CORRUPT_OUTBOX, result)
+                assertNull(result)
                 assertEquals(before, inventory(root))
             } else if (referenced) {
                 assertTrue(result == null || result == ChunkReason.CORRUPT_OUTBOX)
@@ -126,7 +126,7 @@ class StagingRecoveryTest {
             assertThrows(ProcessDeath::class.java) { outbox.stage(attempt.manifest, attempt.plan) }
             val before = inventory(root)
             val result = ChunkOutbox(root).recoverStaging()
-            if (boundary == 1) assertNull(result) else assertEquals(ChunkReason.CORRUPT_OUTBOX, result)
+            assertNull(result)
             assertEquals(before, inventory(root))
             assertEquals(result, ChunkOutbox(root).recoverStaging())
             assertEquals(before, inventory(root))
@@ -272,7 +272,8 @@ class StagingRecoveryTest {
             unpublished(root)
             corrupt(root)
             val before = inventory(root)
-            assertEquals("corruption $index", ChunkReason.CORRUPT_OUTBOX, ChunkOutbox(root).recoverStaging())
+            assertEquals("corruption $index", if (index in 0..8 || index == 11) null else ChunkReason.CORRUPT_OUTBOX,
+                ChunkOutbox(root).recoverStaging())
             assertEquals("corruption $index", before, inventory(root))
             envelope(root)
         }
@@ -294,6 +295,92 @@ class StagingRecoveryTest {
             unpublished(root, manifest)
             val before = inventory(root)
             assertEquals(ChunkReason.CORRUPT_OUTBOX, ChunkOutbox(root).recoverStaging())
+            assertEquals(before, inventory(root))
+        }
+    }
+
+    @Test fun inertChildrenRemainCountedWhileOversizedInputReachesItsNormalResult() {
+        for (streaming in listOf(false, true)) {
+            val root = temporary.newFolder()
+            val inert = File(root, "inert-leftover").apply { mkdir() }
+            File(inert, "child-0.json").writeText("inert attempt bytes")
+            val bytes = inventory(inert)
+            val outbox = ChunkOutbox(root)
+            assertEquals(19L, outbox.retainedBytes())
+            assertNull(outbox.recoverStaging())
+            assertEquals(bytes, inventory(inert))
+            val cursors = FakeChunkCursors()
+            var sends = 0
+            var id = 0
+            val record = syntheticRecord("oversized", "x".repeat(524_288))
+            val input = if (streaming) FreshChunkInput(emptyMap(), FreshRecordProducer { it(record) })
+                else FreshChunkInput(listOf(record), emptyMap())
+            val runner = ChunkSync(outbox, cursors, { _, _ -> sends++; error("No send") }, newId = { "inert-${id++}" })
+            val status = runBlocking { runner.run(true, "https://synthetic.invalid", syntheticMapping) { input } }
+            assertEquals(ChunkPhase.BLOCKED, status.phase)
+            assertEquals(ChunkReason.OVERSIZED, status.reason)
+            assertEquals(0, sends)
+            assertEquals(0, cursors.commits)
+            assertEquals(bytes, inventory(inert))
+            assertTrue(outbox.retainedBytes() >= 19L)
+            val after = inventory(root)
+            val second = runBlocking { runner.run(true, "https://synthetic.invalid", syntheticMapping) { error("No recollection") } }
+            assertEquals(status, second)
+            assertEquals(after, inventory(root))
+        }
+    }
+
+    @Test fun incompleteCleanupProofWithSafeMetadataDoesNotBlockNormalPlanning() {
+        for (damage in listOf("missing", "corrupt", "unknown")) {
+            val root = temporary.newFolder()
+            unpublished(root)
+            when (damage) {
+                "missing" -> File(root, "attempt/reservation").delete()
+                "corrupt" -> File(root, "attempt/reservation").writeText("invalid reservation")
+                "unknown" -> File(root, "attempt/unknown").writeText("retain")
+            }
+            val before = inventory(File(root, "attempt"))
+            val cursors = FakeChunkCursors()
+            var id = 0
+            val outbox = ChunkOutbox(root)
+            val runner = ChunkSync(outbox, cursors, { _, _ -> error("No send") }, newId = { "safe-${id++}" })
+            val result = runBlocking { runner.run(true, "https://synthetic.invalid", syntheticMapping) {
+                FreshChunkInput(listOf(syntheticRecord("oversized", "x".repeat(524_288))), emptyMap())
+            } }
+            assertEquals(ChunkPhase.BLOCKED, result.phase)
+            assertEquals(ChunkReason.OVERSIZED, result.reason)
+            assertEquals(0, cursors.commits)
+            assertEquals(before, inventory(File(root, "attempt")))
+            envelope(root)
+        }
+    }
+
+    @Test fun unreferencedUnknownSendBlocksBeforeCollectionWithoutAnyMutation() {
+        val root = temporary.newFolder()
+        unpublished(root, fixture("attempt").manifest.copy(phase = ChunkPhase.SEND, reason = ChunkReason.UNKNOWN_ACCEPTANCE))
+        val before = inventory(root)
+        val cursors = FakeChunkCursors()
+        val runner = ChunkSync(ChunkOutbox(root), cursors, { _, _ -> error("No send") })
+        repeat(2) {
+            val status = runBlocking { runner.run(true, "https://synthetic.invalid", syntheticMapping) { error("No collection") } }
+            assertEquals(ChunkPhase.BLOCKED, status.phase)
+            assertEquals(ChunkReason.CORRUPT_OUTBOX, status.reason)
+            assertEquals(0, cursors.commits)
+            assertEquals(before, inventory(root))
+        }
+    }
+
+    @Test fun unreadablePointerEntriesBlockWithCorruptionWithoutAnyMutation() {
+        for (name in listOf("active", "active.tmp", "active-proof", "active-proof.tmp", "previous", "previous.tmp")) {
+            val root = temporary.newFolder()
+            File(root, name).mkdir()
+            val before = inventory(root)
+            val cursors = FakeChunkCursors()
+            val runner = ChunkSync(ChunkOutbox(root), cursors, { _, _ -> error("No send") })
+            val status = runBlocking { runner.run(true, "https://synthetic.invalid", syntheticMapping) { error("No collection") } }
+            assertEquals(name, ChunkPhase.BLOCKED, status.phase)
+            assertEquals(name, ChunkReason.CORRUPT_OUTBOX, status.reason)
+            assertEquals(0, cursors.commits)
             assertEquals(before, inventory(root))
         }
     }

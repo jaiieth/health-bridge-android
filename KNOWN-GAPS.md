@@ -80,7 +80,7 @@ Reasons are distinct and have literal messages in SyncStatusDisplay.
 | --- | --- |
 | Planning or quota refusal | No body exists. Durable backpressure prevents recollection. |
 | Caught body/manifest write failure before pointer publication | Only this attempt's known, unpublished files are removed; parent is fsynced. Prior pointer and pending data survive. |
-| Process death during staging or cleanup | Startup reclaims at most one strictly proven, unreferenced staging attempt using a durable evidence tombstone. Ambiguous directories stay counted and fail closed. |
+| Process death during staging or cleanup | Startup reclaims at most one strictly proven, unreferenced staging attempt using a durable evidence tombstone. Inert leftovers stay counted without blocking; ambiguous delivery evidence blocks without deletion. |
 | New proof written, active ID still old | Authenticated previous generation remains selected. |
 | Active renamed before directory fsync | New publication is accepted only after hash/structure checks; otherwise previous is selected. Resume fences precede sends. |
 | SEND persisted, response or ACK persistence lost | UNKNOWN_ACCEPTANCE prevents automatic resend. |
@@ -92,11 +92,15 @@ collection. It requires a strictly parsed matching reservation, no reference fro
 active/proof/previous pointer or temp, no receipt, and only whitelisted regular files.
 Existing manifests and their temps must decode, match the generation and recomputed
 parent fingerprint, have phase STAGE or BLOCKED, exclude UNKNOWN_ACCEPTANCE and all
-sent/ACK timestamps or flags, and agree exactly on child lists. Missing or corrupt
-reservations, unknown files, symlinks, subdirectories, dangling or unauthenticated
-pointers, delivery evidence, and ambiguous metadata cause CORRUPT_OUTBOX or IO_FAILURE
-with no recovery deletion. Recognised DONE history and receipt-owned retention remain
-under the existing retention policy. Legacy Pending prevents the recovery pass entirely.
+sent/ACK timestamps or flags, and agree exactly on child lists. These checks authorize
+deletion only. Inert directories without a current or publication manifest remain
+byte-identical and counted without blocking collection. Missing or corrupt reservations,
+unknown files, symlinks, or subdirectories alongside safe non-delivery metadata likewise
+prevent deletion without blocking. Malformed manifests, invalid fingerprints, differing
+child lists, delivery phases, UNKNOWN_ACCEPTANCE, or sent/ACK evidence block with
+CORRUPT_OUTBOX and no recovery mutation. Dangling, unreadable, or unauthenticated pointers also
+block. Recognised DONE history and receipt-owned retention remain under the existing
+retention policy. Legacy Pending prevents the recovery pass entirely.
 
 Before deletion, recovery atomically writes and fsyncs one bounded staging tombstone.
 Its 11 fields are version, generation, retained payload, bodies, manifest bound, peak,
