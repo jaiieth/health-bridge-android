@@ -29,10 +29,7 @@ internal suspend fun runFreshChunkSync(context: Context, store: Store, settings:
         require(settings.token.isNotBlank())
         val reader = HealthReader(context)
         check(reader.hasPermissions() && reader.canCollect())
-        val (records, targets) = reader.read(store.cursors().associate { it.type to it.until }, Instant.now())
-        FreshChunkInput(List(records.length()) { index -> records.getJSONObject(index).let {
-            ChunkRecord(it.getString("recordId"), it.toString())
-        } }, targets.keys().asSequence().associateWith { targets.getString(it) })
+        reader.freshInput(store.cursors().associate { it.type to it.until }, Instant.now())
     }
     val old = store.status() ?: SyncStatus()
     store.status(old.copy(

@@ -58,6 +58,34 @@ class HealthReader(private val context: Context) {
                 HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND in granted)
     }
 
+    internal fun freshInput(cursors: Map<String, String>, end: Instant): FreshChunkInput =
+        FreshChunkInput(types.associate { checkNotNull(it.simpleName) to end.toString() }, FreshRecordProducer { accept ->
+            check(HealthConnectClient.getSdkStatus(context) == HealthConnectClient.SDK_AVAILABLE) {
+                "Health Connect unavailable"
+            }
+            val client = HealthConnectClient.getOrCreate(context)
+            check(client.permissionController.getGrantedPermissions().containsAll(permissions)) { "Missing read permissions" }
+            for (type in types) {
+                val start = cursors[type.simpleName]?.let(Instant::parse) ?: end.minusSeconds(30L * 86400)
+                produceFreshPages(readPage = { token ->
+                    val response = client.readRecords(ReadRecordsRequest(
+                        type,
+                        timeRangeFilter = TimeRangeFilter.between(start, end),
+                        pageToken = token,
+                        pageSize = 1,
+                    ))
+                    FreshPage(response.records, response.pageToken)
+                }, accept = { record ->
+                    val name = runCatching {
+                        context.packageManager.getApplicationLabel(
+                            context.packageManager.getApplicationInfo(record.metadata.dataOrigin.packageName, 0),
+                        ).toString()
+                    }.getOrNull()
+                    accept(boundedRecordJson(record, name))
+                })
+            }
+        })
+
     suspend fun read(cursors: Map<String, String>, end: Instant): Pair<JSONArray, JSONObject> {
         check(HealthConnectClient.getSdkStatus(context) == HealthConnectClient.SDK_AVAILABLE) {
             "Health Connect unavailable"

@@ -2,12 +2,16 @@ package dev.healthbridge
 
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
+import java.security.MessageDigest
 import org.json.JSONArray
 import org.json.JSONObject
+
+private const val STAGE_HEADROOM_BYTES = 1_048_576L
 
 internal enum class ChunkPhase { PLAN, STAGE, SEND, ACK, COMMIT, DONE, PAUSED, BLOCKED }
 internal enum class ChunkReason { NONE, FLAG_OFF, LEGACY_PENDING, INVALID_TIMESTAMP, UNKNOWN_ACCEPTANCE, INVALID_ACK, HTTP_400, HTTP_409, HTTP_413, HTTP_BLOCKED, HTTP_RETRY, IO_FAILURE, CORRUPT_OUTBOX, ENDPOINT_CHANGED, OVERSIZED }
@@ -38,8 +42,17 @@ internal data class ChunkManifest(
 }
 
 internal fun parentFingerprint(endpointHash: String, records: List<String>, hashes: List<String>, targets: Map<String, String>): String {
-    val parts = listOf("fresh-sync-parent-v1", endpointHash, records.size.toString()) + records.zip(hashes).flatMap { listOf(it.first, it.second) } + listOf(targets.size.toString()) + targets.toSortedMap().flatMap { listOf(it.key, it.value) }
-    return sha256(parts.joinToString("") { "${it.toByteArray(Charsets.UTF_8).size}:$it" }.toByteArray(Charsets.UTF_8))
+    val digest = MessageDigest.getInstance("SHA-256")
+    fun part(value: String) {
+        val bytes = value.toByteArray(Charsets.UTF_8)
+        digest.update("${bytes.size}:".toByteArray(Charsets.UTF_8))
+        digest.update(bytes)
+    }
+    part("fresh-sync-parent-v1"); part(endpointHash); part(records.size.toString())
+    for (index in 0 until minOf(records.size, hashes.size)) { part(records[index]); part(hashes[index]) }
+    part(targets.size.toString())
+    targets.toSortedMap().forEach { (type, until) -> part(type); part(until) }
+    return digest.digest().joinToString("") { "%02x".format(it.toInt() and 255) }
 }
 
 internal enum class DurableBoundary { TEMP_WRITTEN, FILE_SYNCED, RENAMED, DIRECTORY_SYNCED }
@@ -48,20 +61,20 @@ internal class DurableFiles(
     private val fault: (DurableBoundary, String) -> Unit = { _, _ -> },
 ) {
     fun directory(directory: File) {
-        if (!directory.exists()) {
-            check(directory.mkdir())
+        if (!directory.exists() && !directory.mkdir()) {
+            throw IOException("DIRECTORY_CREATE_FAILED")
         }
-        check(directory.isDirectory)
+        if (!directory.isDirectory) throw IOException("NOT_A_DIRECTORY")
         syncDirectory(checkNotNull(directory.parentFile))
     }
 
     fun sync(directory: File) = syncDirectory(directory)
 
-    fun write(file: File, bytes: ByteArray, replace: Boolean = true) {
+    fun write(file: File, bytes: ByteArray, replace: Boolean = true, size: Int = bytes.size) {
         check(replace || !file.exists())
         val temp = File(file.parentFile, file.name + ".tmp")
         FileOutputStream(temp).use {
-            it.write(bytes)
+            it.write(bytes, 0, size)
             it.flush()
             fault(DurableBoundary.TEMP_WRITTEN, file.name)
             it.fd.sync()
@@ -76,7 +89,11 @@ internal class DurableFiles(
 }
 
 /** The caller serializes all access using AppState.mutex. Reads never repair or delete files. */
-internal class ChunkOutbox(private val root: File, private val files: DurableFiles = DurableFiles()) {
+internal class ChunkOutbox(
+    private val root: File,
+    private val files: DurableFiles = DurableFiles(),
+    private val usableSpace: (File) -> Long = { it.usableSpace },
+) {
     private fun generation(value: String): File {
         require(value.matches(Regex("[a-zA-Z0-9-]{1,100}")))
         return File(root, value)
@@ -87,17 +104,60 @@ internal class ChunkOutbox(private val root: File, private val files: DurableFil
     }
 
     fun stage(manifest: ChunkManifest, plan: ChunkPlan.Ready?) {
-        files.directory(root)
         val dir = generation(manifest.generation)
         check(!dir.exists())
+        val manifestBytes = encode(manifest).toByteArray(Charsets.UTF_8)
+        val activeBytes = manifest.generation.toByteArray(Charsets.UTF_8)
+        val required = try {
+            (plan?.children ?: emptyList()).fold(STAGE_HEADROOM_BYTES + manifestBytes.size + activeBytes.size) { total, child ->
+                Math.addExact(total, child.body.size.toLong())
+            }
+        } catch (e: ArithmeticException) { throw IOException("STAGE_SIZE_OVERFLOW", e) }
+        val available = try {
+            val directory = generateSequence(root.absoluteFile) { it.parentFile }.firstOrNull { it.isDirectory }
+                ?: throw IOException("FREE_SPACE_UNAVAILABLE")
+            usableSpace(directory)
+        } catch (e: SecurityException) { throw IOException("FREE_SPACE_UNAVAILABLE", e) }
+        if (available < required) throw IOException("INSUFFICIENT_FREE_SPACE")
+        files.directory(root)
         files.directory(dir)
         plan?.children?.forEachIndexed { index, child -> files.write(bodyFile(manifest, index), child.body, replace = false) }
-        save(manifest)
-        files.write(File(root, "active"), manifest.generation.toByteArray(Charsets.UTF_8))
+        files.write(File(dir, "manifest.json"), manifestBytes)
+        files.write(File(root, "active"), activeBytes)
     }
 
     fun save(manifest: ChunkManifest) {
         files.write(File(generation(manifest.generation), "manifest.json"), encode(manifest).toByteArray(Charsets.UTF_8))
+    }
+
+    fun beginStreaming(generation: String) {
+        val dir = generation(generation)
+        check(!dir.exists())
+        preflight(STAGE_HEADROOM_BYTES)
+        files.directory(root)
+        files.directory(dir)
+    }
+
+    fun stageBody(generation: String, index: Int, bytes: ByteArray, size: Int) {
+        require(index in 0 until 100 && size in 0..524_288 && size <= bytes.size)
+        preflight(STAGE_HEADROOM_BYTES + size)
+        files.write(File(generation(generation), "child-$index.json"), bytes, replace = false, size = size)
+    }
+
+    fun publishStreaming(manifest: ChunkManifest) {
+        val bytes = encode(manifest).toByteArray(Charsets.UTF_8)
+        val active = manifest.generation.toByteArray(Charsets.UTF_8)
+        preflight(STAGE_HEADROOM_BYTES + bytes.size + active.size)
+        files.write(File(generation(manifest.generation), "manifest.json"), bytes)
+        files.write(File(root, "active"), active)
+    }
+
+    private fun preflight(required: Long) {
+        val directory = generateSequence(root.absoluteFile) { it.parentFile }.firstOrNull { it.isDirectory }
+            ?: throw IOException("FREE_SPACE_UNAVAILABLE")
+        val available = try { usableSpace(directory) }
+        catch (e: SecurityException) { throw IOException("FREE_SPACE_UNAVAILABLE", e) }
+        if (available < required) throw IOException("INSUFFICIENT_FREE_SPACE")
     }
 
     fun load(): ChunkManifest? {
@@ -127,15 +187,18 @@ internal class ChunkOutbox(private val root: File, private val files: DurableFil
             require(manifest.children.sumOf { it.count } == manifest.recordIds.size)
         }
         if (manifest.phase == ChunkPhase.COMMIT || manifest.phase == ChunkPhase.DONE) require(manifest.children.all { it.acked })
-        val ids = mutableListOf<String>()
+        var recordIndex = 0
         manifest.children.forEachIndexed { index, child ->
+            require(bodyFile(manifest, index).exists()) { "MISSING_REFERENCED_BODY" }
             val json = JSONObject(body(manifest, index).toString(Charsets.UTF_8))
             require(json.length() == 3 && json.getInt("schemaVersion") == 1 && json.getString("batchId") == child.batchId)
             val records = json.getJSONArray("records")
             require(records.length() == child.count)
-            repeat(records.length()) { ids += records.getJSONObject(it).getString("recordId") }
+            repeat(records.length()) {
+                require(records.getJSONObject(it).getString("recordId") == manifest.recordIds.getOrNull(recordIndex++))
+            }
         }
-        if (manifest.children.isNotEmpty()) require(ids == manifest.recordIds)
+        if (manifest.children.isNotEmpty()) require(recordIndex == manifest.recordIds.size)
         return manifest
     }
 
@@ -145,7 +208,9 @@ internal class ChunkOutbox(private val root: File, private val files: DurableFil
         files.sync(generation(manifest.generation))
     }
 
-    fun status(): ChunkStatus? = try { load()?.status() } catch (_: Exception) { ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.CORRUPT_OUTBOX) }
+    fun status(): ChunkStatus? = try { load()?.status() }
+        catch (_: IOException) { ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE) }
+        catch (_: Exception) { ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.CORRUPT_OUTBOX) }
 
     private fun encode(m: ChunkManifest): String = JSONObject().apply {
         put("formatVersion", 1)

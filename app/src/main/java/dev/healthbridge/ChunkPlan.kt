@@ -28,7 +28,7 @@ internal object ChunkPartitioner {
     fun envelope(batchId: String, records: List<ChunkRecord>): ByteArray =
         (prefix(batchId) + records.joinToString(",") { it.json } + "]}").toByteArray(Charsets.UTF_8)
 
-    private fun prefix(batchId: String) = "{\"schemaVersion\":1,\"batchId\":" + EcmaJson.quote(batchId) + ",\"records\":["
+    internal fun prefix(batchId: String) = "{\"schemaVersion\":1,\"batchId\":" + EcmaJson.quote(batchId) + ",\"records\":["
 
     fun partition(records: List<ChunkRecord>, childIds: List<String>, mapping: VerifiedReceiverMapping, limits: ChunkLimits): ChunkPlan {
         require(childIds.size >= records.size.coerceAtLeast(1))

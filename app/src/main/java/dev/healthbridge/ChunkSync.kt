@@ -1,8 +1,15 @@
 package dev.healthbridge
 
+import java.io.IOException
 import java.util.UUID
 
-internal data class FreshChunkInput(val records: List<ChunkRecord>, val targetCursors: Map<String, String>)
+internal data class FreshChunkInput(
+    val records: List<ChunkRecord>,
+    val targetCursors: Map<String, String>,
+    val producer: FreshRecordProducer? = null,
+) {
+    constructor(targetCursors: Map<String, String>, producer: FreshRecordProducer) : this(emptyList(), targetCursors, producer)
+}
 internal data class ChunkResponse(val code: Int, val body: String)
 internal interface ChunkCursorStore {
     suspend fun hasLegacyPending(): Boolean
@@ -32,11 +39,13 @@ internal class ChunkSync(
     ): ChunkStatus {
         if (!enabled) return ChunkStatus(ChunkPhase.PLAN, reason = ChunkReason.FLAG_OFF)
         if (cursors.hasLegacyPending()) return ChunkStatus(ChunkPhase.BLOCKED, reason = ChunkReason.LEGACY_PENDING)
-        var manifest = try { outbox.load() } catch (_: Exception) {
+        var manifest = try { outbox.load()?.takeUnless { it.phase == ChunkPhase.DONE } } catch (_: IOException) {
+            return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE)
+        } catch (_: Exception) {
             return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.CORRUPT_OUTBOX)
         }
         val endpointHash = sha256(endpoint.toByteArray(Charsets.UTF_8))
-        if (manifest != null && manifest.phase != ChunkPhase.DONE) {
+        if (manifest != null) {
             if (manifest.phase == ChunkPhase.PAUSED || manifest.phase == ChunkPhase.BLOCKED) return manifest.status()
             if (manifest.phase == ChunkPhase.SEND) return stop(manifest, ChunkPhase.PAUSED, ChunkReason.UNKNOWN_ACCEPTANCE)
             if (manifest.endpointHash != endpointHash) return stop(manifest, ChunkPhase.PAUSED, ChunkReason.ENDPOINT_CHANGED)
@@ -45,28 +54,39 @@ internal class ChunkSync(
             }
         } else {
             val input = collect()
-            val ids = List(input.records.size.coerceAtLeast(1)) { newId() }
-            require(ids.all { receiverBatchId.matches(it) }) { "INVALID_BATCH_ID" }
-            val plan = ChunkPartitioner.partition(input.records, ids, mapping, limits)
-            val now = clock()
-            val recordIds = input.records.map { it.recordId }
-            val recordHashes = input.records.map { sha256(it.json.toByteArray(Charsets.UTF_8)) }
-            val targets = input.targetCursors.toSortedMap()
-            val children = (plan as? ChunkPlan.Ready)?.children?.mapIndexed { index, child ->
-                ChunkChild(index, child.batchId, sha256(child.body), child.records.size)
-            } ?: emptyList()
-            val blocked = plan as? ChunkPlan.Blocked
-            manifest = ChunkManifest(newId(), parentFingerprint(endpointHash, recordIds, recordHashes, targets), endpointHash,
-                recordIds, recordHashes, targets, now, now, if (blocked == null) ChunkPhase.STAGE else ChunkPhase.BLOCKED, children,
-                when (blocked?.cause) {
-                    null -> ChunkReason.NONE
-                    ChunkBlockCause.OVERSIZED -> ChunkReason.OVERSIZED
-                    ChunkBlockCause.INVALID_TIMESTAMP -> ChunkReason.INVALID_TIMESTAMP
-                }, blocked?.recordId, blocked?.wireBytes, blocked?.mappedBytes)
-            try { outbox.stage(manifest, plan as? ChunkPlan.Ready) } catch (_: Exception) {
-                return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE)
+            if (input.producer != null) {
+                manifest = try {
+                    StreamingChunkPlanner(outbox, mapping, limits, newId, clock).stage(input, endpointHash)
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE)
+                }
+                if (manifest.phase == ChunkPhase.BLOCKED) return manifest.status()
+            } else {
+                val ids = List(input.records.size.coerceAtLeast(1)) { newId() }
+                require(ids.all { receiverBatchId.matches(it) }) { "INVALID_BATCH_ID" }
+                val plan = ChunkPartitioner.partition(input.records, ids, mapping, limits)
+                val now = clock()
+                val recordIds = input.records.map { it.recordId }
+                val recordHashes = input.records.map { sha256(it.json.toByteArray(Charsets.UTF_8)) }
+                val targets = input.targetCursors.toSortedMap()
+                val children = (plan as? ChunkPlan.Ready)?.children?.mapIndexed { index, child ->
+                    ChunkChild(index, child.batchId, sha256(child.body), child.records.size)
+                } ?: emptyList()
+                val blocked = plan as? ChunkPlan.Blocked
+                manifest = ChunkManifest(newId(), parentFingerprint(endpointHash, recordIds, recordHashes, targets), endpointHash,
+                    recordIds, recordHashes, targets, now, now, if (blocked == null) ChunkPhase.STAGE else ChunkPhase.BLOCKED, children,
+                    when (blocked?.cause) {
+                        null -> ChunkReason.NONE
+                        ChunkBlockCause.OVERSIZED -> ChunkReason.OVERSIZED
+                        ChunkBlockCause.INVALID_TIMESTAMP -> ChunkReason.INVALID_TIMESTAMP
+                    }, blocked?.recordId, blocked?.wireBytes, blocked?.mappedBytes)
+                try { outbox.stage(manifest, plan as? ChunkPlan.Ready) } catch (_: Exception) {
+                    return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE)
+                }
+                if (blocked != null) return manifest.status()
             }
-            if (blocked != null) return manifest.status()
         }
         var current = checkNotNull(manifest)
         try {
@@ -111,7 +131,7 @@ internal class ChunkSync(
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (_: Exception) {
-            return stop(current, ChunkPhase.PAUSED, ChunkReason.IO_FAILURE)
+            return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE)
         }
     }
 

@@ -1,10 +1,10 @@
 # Stage 2 collection and outbox budgets
 
-This is a plan only. It implements no collection, retention, cleanup, deletion, or wire-format change. Keep fresh chunking OFF until the admission limits, failure tests, and SDK memory qualification below pass. Consent ON is not readiness.
+The original collection, quota, and retention proposal is retained below. Implementation notes distinguish the approved local changes from the remaining proposals and unverified platform behavior. Keep fresh chunking OFF. Consent ON is not readiness.
 
-## Current numbers observed in source
+## Baseline numbers at 63dca70
 
-These are code constants and control-flow observations, not runtime memory measurements. Reproduce with `nl -ba app/src/main/java/dev/healthbridge/{HealthReader,RecordJson,FreshChunkSync,ChunkPlan,ChunkSync,ChunkOutbox}.kt`.
+These are baseline code constants and control-flow observations, not runtime memory measurements. Inspect the named files at commit `63dca70`. The implementation notes below supersede collection and admission observations changed by this work.
 
 - `HealthReader.kt:17` lists six record types: sleep sessions, HRV RMSSD, resting heart rate, heart rate, steps, and exercise sessions.
 - `HealthReader.kt:72` uses the saved cursor, otherwise a 30-day lookback, or 2,592,000 seconds. An old cursor can make the window longer than 30 days.
@@ -14,7 +14,7 @@ These are code constants and control-flow observations, not runtime memory measu
 - `ChunkPlan.kt:9` caps each child at 524,288 wire bytes, 5,000 records, and 900,000 mapped-array UTF-8 bytes. Wire size includes the envelope. Mapped size includes brackets, commas, and escaping.
 - `ChunkSync.kt` has no generation record, child, or aggregate byte cap. `ChunkOutbox.kt:89` stages every child and retains prior generation directories. It has no GC.
 
-## Current arithmetic projections
+## Baseline arithmetic projections
 
 Let P be the total pages across the six types and R the total records. R is at most 1,000P if the provider honors pageSize, but P has no local upper bound. Six types do not imply a maximum of 6,000 records. The window does not constrain sample density. Therefore worst-case retained records and bytes in memory are **unbounded by this code**, including for a 30-day initial read. Actual JVM heap usage and RSS were not measured.
 
@@ -67,4 +67,40 @@ On disk full or any failed write, flush, fsync, rename, or directory fsync, fail
 
 ## Required proof before live enabling
 
-Add fault-injection tests at every new budget and publication boundary, including disk exhaustion during each child, manifest, and active-marker write. Exercise multi-page input, a page spanning chunks, one oversized nested record, generation-cap exhaustion, protected UNKNOWN quota exhaustion, and crash recovery after cursor commit. Confirm bounded allocation with a real SDK workload and qualify B and the SDK page ceiling. Confirm that every rejection preserves Pending, attempts, cursors, prior active data, and UNKNOWN evidence. None of these future bounded-collection or GC tests was run as part of this plan-only document.
+Add fault-injection tests at every new budget and publication boundary, including disk exhaustion during each child, manifest, and active-marker write. Exercise multi-page input, a page spanning chunks, one oversized nested record, generation-cap exhaustion, protected UNKNOWN quota exhaustion, and crash recovery after cursor commit. Confirm bounded allocation with a real SDK workload and qualify B and the SDK page ceiling. Confirm that every rejection preserves Pending, attempts, cursors, prior active data, and UNKNOWN evidence. Synthetic collection, disk-write, and admission tests are described below. GC, quota exhaustion, and real-SDK allocation qualification remain unimplemented.
+
+## Local disk-write implementation and limits
+
+The free-space precheck runs before durable staging and publication. The list-based test route counts all incoming child bodies, the encoded initial manifest, the active marker, and 1,048,576 bytes of headroom. The streaming route checks headroom before directory creation, headroom plus the next body before a child write, and headroom plus the encoded manifest and marker before publication. It refuses admission with PAUSED and IO_FAILURE when available space is insufficient or the space query fails. It never deletes Pending, prior generations, unknown-acceptance evidence, or orphan files. This check is not a reservation, a quota, a filesystem-allocation bound, or protection against concurrent disk consumption. The proposed 84 MiB reservation and 256 MiB quota above remain unimplemented.
+
+After a failed durable write, the runner returns PAUSED and IO_FAILURE without attempting a second manifest write from its in-memory state. The failed temporary file and last published manifest remain as they were at the failure. A later run can resume an active STAGE, ACK, or COMMIT generation after the existing directory durability fence. It uses the stored batch IDs and body bytes and skips durably acknowledged children.
+
+Three recovery limits remain under the existing persistence protocol:
+
+- A child or initial-manifest failure before publication can leave an orphan without a durable active pointer. The existing loader cannot discover its original plan, IDs, targets, or missing bytes. This change preserves the orphan and does not claim identical-generation recovery from it.
+- An ACK failure before atomic publication leaves SEND as the published state. A temporary ACK is not durable acceptance evidence. Restart follows the existing UNKNOWN_ACCEPTANCE pause and does not resend that child or advance cursors. Automatic completion is not claimed.
+- A DONE failure after Room has successfully committed cannot roll back the cursor transaction. Restart from COMMIT can finish without resending children. A failed cursor transaction before commit leaves cursor targets unchanged. Making the outbox and Room one atomic commit would require a separate persistence design.
+
+At baseline, R records required R JSON objects, R JSON strings, and R ID/hash pairs, plus up to 524,288C body bytes for C children. Those totals had no generation cap. The child limits remain at most 524,288 wire bytes, 5,000 records, and 900,000 mapped-array UTF-8 bytes.
+
+Real Health Connect allocations, real-device behavior, receiver behavior, filesystem power-loss behavior, and phone installation remain unverified. All new fixtures are synthetic JVM data. Fresh chunking remains OFF.
+
+## Implemented fresh collection bounds
+
+The fresh path uses `HealthReader.freshInput` and a record producer. The legacy reader remains unchanged. Production requests one type and one record per page. A helper consumes the page and returns only its next token before the next request. Each record passes through a fixed 524,288-byte UTF-8 writer. Overflow rejects the entire window, including an oversized nested array, rather than truncating or omitting samples. The planner stages completed children in the existing unpublished generation directory. It publishes the unchanged manifest and active marker only after collection succeeds, or a BLOCKED/OVERSIZED manifest with zero referenced children after refusal. Late refusal can leave unpublished child files; those files are retained as evidence.
+
+For W = R = 524,288 bytes, the planner retains one W-byte child array, one incoming string of at most R UTF-16 code units, and its R-byte UTF-8 encoding. Payload content is at most W + 2R + R = 2,097,152 bytes. Conservatively including the serializer's fixed R-byte array gives W + 4R = 2,621,440 bytes, or 2.5 MiB. UTF-8 conversion additionally permits 4R = 2,097,152 temporary codec buffer bytes. This covers at most 5,000 buffered record payloads plus one incoming record, not 5,001 separately retained record objects. No collection-wide JSON array, record-string list, or child-body list is retained by the production fresh path.
+
+Generation admission caps metadata before insertion at 100,000 ID/hash pairs, 100 child descriptors, and 16,777,216 UTF-16 content bytes for IDs and hashes. There are at most six fixed type/timestamp targets. A refused record ID retained in the blocked diagnostic adds at most 1,048,576 UTF-16 bytes. Refusal uses the existing OVERSIZED reason and blocks the entire window with no send or cursor advance. These are new generation admission limits, not changes to the child caps or time-window targets. An over-cap window needs a separate product decision; this change never shortens it silently.
+
+The production mapped-byte counter parses only the bounded incoming record and counts the existing receiver representation without constructing a payload string or mapped-record string. Its parse has at most R values/containers, R map entries, R logical list entries, R decoded string code units, and 129 parser or visitor frames. Backing arrays permit 10R list slots and 4R map-table slots. Numeric-key ordering permits 6R + 1290 reference slots, R pairs, and R boxed indices. Numeric conversion has a separate 1 MiB scratch allowance; fingerprint conversion has at most 3R = 1,572,864 UTF-8 bytes. The source comment gives the component arithmetic. These are content and object-count bounds, not measured allocator sizes. Tests also inject small synthetic mappings; arbitrary injected mapping implementations are outside the production bound.
+
+The existing manifest JSON encoder remains. Metadata admission bounds its input but does not make it a small streaming encoder. With M = 16,777,216 metadata bytes, a separately retained blocked ID of at most R code units, 100 children, and fixed targets, a conservative escaped-text bound is E = 6(M/2 + R) + 1024(100) + 4096 = 53,583,872 code units or UTF-8 bytes. The source comment allows 8E = 428,670,976 string/buffer content bytes during encoding, plus bounded JSON object and reference counts. This is deliberately conservative arithmetic from the capped input and escaping rules. It is not a measured heap peak or an allocator limit. The original proposed 16 MiB total application budget is not implemented or proven. Fingerprinting now hashes the same length-prefixed fields incrementally and retains no joined window-wide string.
+
+Existing resumed generations and corrupt file sizes are not newly capped. Their loading behavior is preserved. SDK page graphs, nested SDK arrays, page tokens, source-name lookup allocations, object headers, garbage-collection timing, transport responses, and whole-process heap or RSS are not covered by the fresh serializer/planner payload arithmetic. In particular, `pageSize = 1` does not establish a byte bound on an SDK record. Those qualifications remain gates before live enabling.
+
+## Verified local synthetic evidence
+
+`source /home/ubuntu/toolchain/env.sh` followed by `./gradlew test lint assembleDebug` passed locally. Debug and Release each ran 215 JVM tests, including all 174 baseline test identities and 41 new tests, with zero failures, errors, or skips. The streaming tests exercise 20,000 pages and compare every input record hash with records in the actual child files. They also compare reference partition bytes and boundaries, exercise oversized nested records and generation refusal, and inject write failures through both collection routes.
+
+Lint reported zero errors and 11 warnings. Nine are existing dependency and SharedPreferences advisories. Two UsableSpace advisories recommend Android cache-aware allocation APIs. The implemented guard deliberately checks currently available space without cache reclamation or reservation. Debug assembly produced the local APK; it was not installed. The verification log is `/tmp/hb-approved-final.log`; parsed test and lint totals are in `/tmp/hb-approved-evidence.txt`. These results do not close the platform and recovery limits documented above.
