@@ -314,7 +314,7 @@ class ChunkStreamingTest {
         assertEquals(mapOf("steps" to "old", "sleep" to "old"), cursors.values)
     }
 
-    @Test fun defaultSixteenMiBMetadataCapCountsIdsAndHashesBeforeInsertion() {
+    @Test fun defaultManifestBudgetCountsIdsAndHashesBeforeInsertion() {
         val outbox = ChunkOutbox(root())
         val retention = StreamingRetention()
         val manifest = stage(outbox, input { accept ->
@@ -323,12 +323,12 @@ class ChunkStreamingTest {
                 accept(ChunkRecord(id, "{\"recordId\":\"$id\"}"))
             }
         }, retention = retention, mapping = syntheticMapping)
-        assertEquals(16_777_216L, retention.metadataUtf16Bytes)
-        assertEquals(1024, retention.recordCount)
-        assertEquals(1024, manifest.recordHashes.size)
+        assertEquals(16_547_840L, retention.metadataUtf16Bytes)
+        assertEquals(1010, retention.recordCount)
+        assertEquals(1010, manifest.recordHashes.size)
         assertEquals(ChunkReason.OVERSIZED, manifest.reason)
         assertTrue(manifest.children.isEmpty())
-        assertEquals(manifest, outbox.load())
+        assertNull(outbox.load())
     }
 
     @Test fun invalidAndRepeatedBatchIdsCannotPublishAStream() {

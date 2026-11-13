@@ -138,6 +138,9 @@ internal class ChunkOutbox(
         files.directory(dir)
     }
 
+    fun retainedBytes(): Long = if (!root.exists()) 0 else root.walkTopDown().onFail { _, error -> throw error }.filter { it.isFile }
+        .fold(0L) { total, file -> Math.addExact(total, Files.size(file.toPath())) }
+
     fun stageBody(generation: String, index: Int, bytes: ByteArray, size: Int) {
         require(index in 0 until 100 && size in 0..524_288 && size <= bytes.size)
         preflight(STAGE_HEADROOM_BYTES + size)
@@ -212,27 +215,30 @@ internal class ChunkOutbox(
         catch (_: IOException) { ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE) }
         catch (_: Exception) { ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.CORRUPT_OUTBOX) }
 
-    private fun encode(m: ChunkManifest): String = JSONObject().apply {
-        put("formatVersion", 1)
-        put("generation", m.generation)
-        put("fingerprint", m.fingerprint)
-        put("endpointHash", m.endpointHash)
-        put("recordIds", JSONArray(m.recordIds))
-        put("recordHashes", JSONArray(m.recordHashes))
-        put("recordCount", m.recordIds.size)
-        put("targets", JSONObject(m.targets))
-        put("createdAt", m.createdAt)
-        put("updatedAt", m.updatedAt)
-        put("phase", m.phase.name)
-        put("reason", m.reason.name)
-        put("blockedRecordId", m.blockedRecordId ?: JSONObject.NULL)
-        put("blockedWireBytes", m.blockedWireBytes ?: JSONObject.NULL)
-        put("blockedMappedBytes", m.blockedMappedBytes ?: JSONObject.NULL)
-        put("children", JSONArray().apply { m.children.forEach { c -> put(JSONObject().apply {
-            put("index", c.index); put("batchId", c.batchId); put("bodySha", c.bodySha); put("count", c.count)
-            put("acked", c.acked); put("sentAt", c.sentAt ?: JSONObject.NULL); put("ackedAt", c.ackedAt ?: JSONObject.NULL)
-        }) } })
-    }.toString()
+    private fun encode(m: ChunkManifest): String {
+        require(manifestEncodedBytes(m) <= FreshGenerationLimits().manifestBytes) { "MANIFEST_BYTE_BUDGET" }
+        return JSONObject().apply {
+            put("formatVersion", 1)
+            put("generation", m.generation)
+            put("fingerprint", m.fingerprint)
+            put("endpointHash", m.endpointHash)
+            put("recordIds", JSONArray(m.recordIds))
+            put("recordHashes", JSONArray(m.recordHashes))
+            put("recordCount", m.recordIds.size)
+            put("targets", JSONObject(m.targets))
+            put("createdAt", m.createdAt)
+            put("updatedAt", m.updatedAt)
+            put("phase", m.phase.name)
+            put("reason", m.reason.name)
+            put("blockedRecordId", m.blockedRecordId ?: JSONObject.NULL)
+            put("blockedWireBytes", m.blockedWireBytes ?: JSONObject.NULL)
+            put("blockedMappedBytes", m.blockedMappedBytes ?: JSONObject.NULL)
+            put("children", JSONArray().apply { m.children.forEach { c -> put(JSONObject().apply {
+                put("index", c.index); put("batchId", c.batchId); put("bodySha", c.bodySha); put("count", c.count)
+                put("acked", c.acked); put("sentAt", c.sentAt ?: JSONObject.NULL); put("ackedAt", c.ackedAt ?: JSONObject.NULL)
+            }) } })
+        }.toString()
+    }
 
     private fun decode(text: String): ChunkManifest {
         val j = JSONObject(text)

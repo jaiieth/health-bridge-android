@@ -82,6 +82,7 @@ internal class ChunkSync(
                         ChunkBlockCause.OVERSIZED -> ChunkReason.OVERSIZED
                         ChunkBlockCause.INVALID_TIMESTAMP -> ChunkReason.INVALID_TIMESTAMP
                     }, blocked?.recordId, blocked?.wireBytes, blocked?.mappedBytes)
+                require(manifestEncodedBytes(manifest) <= FreshGenerationLimits().manifestBytes) { "MANIFEST_BYTE_BUDGET" }
                 try { outbox.stage(manifest, plan as? ChunkPlan.Ready) } catch (_: Exception) {
                     return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE)
                 }

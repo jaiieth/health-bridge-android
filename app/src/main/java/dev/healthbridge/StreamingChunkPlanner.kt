@@ -6,11 +6,16 @@ import java.time.Instant
 internal data class FreshGenerationLimits(
     val records: Int = 100_000,
     val children: Int = 100,
-    val metadataUtf16Bytes: Long = 16L * 1024 * 1024,
+    val manifestBytes: Long = 8L * 1024 * 1024,
+    // UTF-16 content is at most twice its UTF-8 bytes; escaped-byte admission is stricter.
+    val metadataUtf16Bytes: Long = 2 * (manifestBytes - 106_496).coerceAtLeast(0),
+    val queueBytes: Long = 64L * 1024 * 1024,
 ) {
     init {
         require(records in 1..100_000 && children in 1..100)
-        require(metadataUtf16Bytes in 0..16L * 1024 * 1024)
+        require(manifestBytes in 1..8L * 1024 * 1024)
+        require(metadataUtf16Bytes in 0..2 * (manifestBytes - 106_496).coerceAtLeast(0))
+        require(queueBytes in 0..64L * 1024 * 1024)
     }
 }
 
@@ -45,7 +50,7 @@ internal class StreamingRetention {
  *
  * Metadata has two lists of <=100000 entries, <=100 child descriptors and batch IDs,
  * and six type/timestamp targets of <=40 chars each. Record ID + hash string content
- * is checked BEFORE insertion at <=16777216 UTF-16 bytes. A rejected ID, if retained,
+ * is checked BEFORE insertion at <=16564224 UTF-16 bytes. A rejected ID, if retained,
  * is separately <=2R bytes. Child IDs are <=128 chars and SHA strings are 64 chars.
  * List backing capacity is <150001 references per list; child/set capacity is <=256.
  *
@@ -59,14 +64,13 @@ internal class StreamingRetention {
  * scratch allowance for <=100 decimal temporaries of <=1076 digits / <=128 int
  * limbs each. This excludes arbitrary injected test mappings.
  *
- * Manifest encoding still uses the existing JSON format. With M=16777216 metadata
- * bytes plus a separate <=R-char rejected ID, its escaped text is bounded by
- * E=6*(M/2+R)+1024*100+4096=53583872 chars/UTF-8 bytes.
- * Encoding scratch conservatively permits 8E=428670976 string/buffer bytes, <=200000
- * JSON array entries, <=100 child objects and <=1100 child fields. Fingerprinting
- * hashes one bounded ID/hash at a time with <=3R=1572864 UTF-8 bytes, not the
- * concatenated window. These are
- * content/capacity and object-count bounds, NOT a JVM heap/RSS or allocator claim.
+ * Manifest encoding is guarded before allocating JSON objects or encoded text at
+ * <=8388608 UTF-8 bytes. Raw ID/hash content is <=16564224 UTF-16 bytes by default;
+ * escaped strings and JSON overhead are counted separately before insertion.
+ * Child body staging enforces a cumulative outbox quota of <=67108864 bytes,
+ * including files retained from older generations, before each body write.
+ * Refusal never deletes evidence or commits cursors. These are enforced content
+ * bounds, not JVM heap/RSS or allocator claims.
  * SDK record graphs/pages, page tokens and sourceName lookup allocations are outside
  * this app-owned serialization/planning bound and remain explicitly unverified.
  */
@@ -100,6 +104,10 @@ internal class StreamingChunkPlanner(
         var count = 0
         var mapped = 2L
         var metadataUtf16Bytes = 0L
+        var manifestBound = manifestBaseBytes(generation, endpointHash, targets) + generationLimits.children * 1024L
+        var queueBytes = outbox.retainedBytes()
+        var publish = true
+        val hashPlaceholder = "0".repeat(64)
 
         fun refuse(record: ChunkRecord?, wire: Long, mappedBytes: Long?, cause: ChunkBlockCause = ChunkBlockCause.OVERSIZED): Nothing {
             throw Refused(ChunkPlan.Blocked(record?.recordId?.takeIf { it.length <= FRESH_RECORD_BYTES }, wire, mappedBytes, if (record == null) 0 else 1, cause))
@@ -115,20 +123,34 @@ internal class StreamingChunkPlanner(
         }
         fun stageChild() {
             if (size + 2L > limits.wireBytes || mapped > limits.mappedBytes) refuse(null, size + 2L, mapped)
+            if (size + 2L > generationLimits.queueBytes - queueBytes) {
+                publish = false
+                refuse(null, size + 2L, mapped)
+            }
             buffer[size++] = ']'.code.toByte()
             buffer[size++] = '}'.code.toByte()
             val digest = MessageDigest.getInstance("SHA-256").apply { update(buffer, 0, size) }.digest()
             val hash = digest.joinToString("") { "%02x".format(it.toInt() and 255) }
             outbox.stageBody(generation, children.size, buffer, size)
+            queueBytes += size
             children += ChunkChild(children.size, batchId, hash, count)
             retention.childCount = children.size
         }
         var blocked: ChunkPlan.Blocked? = null
         try {
+            if (manifestBound > generationLimits.manifestBytes) {
+                publish = false
+                refuse(null, 0, null)
+            }
             startChild()
             producer.produce { record ->
                 val wireSize = boundedUtf8Size(record.json)
                 if (wireSize > FRESH_RECORD_BYTES || record.recordId.length > FRESH_RECORD_BYTES) refuse(record, wireSize, null)
+                val contribution = manifestRecordBytes(record.recordId, hashPlaceholder)
+                if (contribution > generationLimits.manifestBytes - manifestBound) {
+                    publish = false
+                    refuse(record, wireSize, null)
+                }
                 val metadataBytes = 2L * (record.recordId.length + 64L)
                 if (recordIds.size == generationLimits.records || metadataBytes > generationLimits.metadataUtf16Bytes - metadataUtf16Bytes) {
                     refuse(record, wireSize, null)
@@ -137,6 +159,7 @@ internal class StreamingChunkPlanner(
                 retention.sample(buffer.size, count, record, encoded.size)
                 recordIds += record.recordId
                 recordHashes += sha256(encoded)
+                manifestBound += contribution
                 metadataUtf16Bytes += metadataBytes
                 retention.metadataUtf16Bytes = metadataUtf16Bytes
                 retention.recordCount = recordIds.size
@@ -178,6 +201,11 @@ internal class StreamingChunkPlanner(
                 ChunkBlockCause.OVERSIZED -> ChunkReason.OVERSIZED
                 ChunkBlockCause.INVALID_TIMESTAMP -> ChunkReason.INVALID_TIMESTAMP
             }, blocked?.recordId, blocked?.wireBytes, blocked?.mappedBytes)
+        val encodedBound = manifestEncodedBytes(manifest)
+        if (!publish || encodedBound > generationLimits.manifestBytes ||
+            encodedBound + generation.length > generationLimits.queueBytes - queueBytes) {
+            return manifest.copy(phase = ChunkPhase.BLOCKED, children = emptyList(), reason = ChunkReason.OVERSIZED)
+        }
         outbox.publishStreaming(manifest)
         return manifest
     }
