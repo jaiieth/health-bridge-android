@@ -6,6 +6,7 @@
     <string name="test_requested">Test requested. Waiting for a recorded acknowledgement.</string>
     <string name="control_save_failed">Could not save sync control. Try again.</string>
     <string name="status_details">%1$s\n%2$s\n%3$s</string>
+    <string name="status_with_recorded_outcome">%1$s\n%2$s</string>
     <string name="destination_host">Destination · %1$s</string>
     <string name="saving_settings">Saving settings…</string>
     <string name="save_settings">Save settings</string>
