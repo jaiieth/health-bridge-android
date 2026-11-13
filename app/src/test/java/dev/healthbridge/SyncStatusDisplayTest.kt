@@ -53,13 +53,16 @@ class SyncStatusDisplayTest {
         }
     }
 
-    @Test fun gatedControlsAllowOnlyConsentOffAndKeepConfiguredTestAvailable() {
+    @Test fun productionGateControlsKeepConsentAndConfiguredTestRequirements() {
         for (consent in listOf(false, true)) for (configured in listOf(false, true))
             for (permissions in listOf(false, true)) for (pending in listOf(false, true)) {
                 val s = SyncStatusDisplay.Snapshot(consent, configured, permissions, pending = pending)
-                assertEquals(SyncStatusDisplay.Controls(consent, false, configured), SyncStatusDisplay.controls(s))
-                assertEquals(if (consent) "Saved health consent: ON (turn OFF)" else "Saved health consent: OFF",
-                    SyncStatusDisplay.consentLabel(s))
+                val gate = ChunkContracts.freshChunkingEnabled
+                assertEquals(SyncStatusDisplay.Controls(gate || consent, gate && consent && configured && permissions, configured),
+                    SyncStatusDisplay.controls(s))
+                val label = if (gate) { if (consent) "Sync ON" else "Sync OFF" }
+                    else if (consent) "Saved health consent: ON (turn OFF)" else "Saved health consent: OFF"
+                assertEquals(label, SyncStatusDisplay.consentLabel(s))
                 assertEquals(consent, s.enabled)
             }
     }

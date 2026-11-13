@@ -49,6 +49,22 @@ class SyncControlTest {
         }, freshChunkingEnabled)
     }
 
+    @Test fun absentPreferenceStaysOffUntilUserExplicitlyEnablesSync() {
+        val fixture = Fixture(false, freshChunkingEnabled = ChunkContracts.freshChunkingEnabled)
+        fixture.values.remove("sync_enabled")
+        assertFalse(fixture.settings.syncEnabled)
+        assertTrue(fixture.control.enforceDisabled())
+        fixture.control.save("https://synthetic.invalid", "synthetic", 90)
+        assertFalse(fixture.settings.syncEnabled)
+        assertFalse(fixture.values.containsKey("sync_enabled"))
+        assertEquals(emptyList<String>(), fixture.calls)
+        assertTrue(fixture.control.setEnabled(true))
+        assertTrue(fixture.settings.syncEnabled)
+        assertEquals(listOf("schedule:90"), fixture.calls)
+        assertTrue(fixture.control.setEnabled(false))
+        assertFalse(fixture.settings.syncEnabled)
+    }
+
     @Test fun gatedBuildRefusesEnableWithoutWritingConsentOrScheduling() {
         val fixture = Fixture(false, freshChunkingEnabled = false)
         assertFalse(fixture.control.setEnabled(true))
@@ -73,13 +89,16 @@ class SyncControlTest {
         assertEquals(1, fixture.writes)
     }
 
-    @Test fun gatedRenderingPreservesBothConsentValuesWithoutWritesOrScheduling() {
+    @Test fun productionGateRenderingPreservesBothConsentValuesWithoutWritesOrScheduling() {
         listOf(false, true).forEach { consent ->
-            val fixture = Fixture(consent, freshChunkingEnabled = false)
+            val gate = ChunkContracts.freshChunkingEnabled
+            val fixture = Fixture(consent, freshChunkingEnabled = gate)
             repeat(2) {
                 val snapshot = SyncStatusDisplay.Snapshot(fixture.settings.syncEnabled, true, true)
-                assertEquals("Build gated", SyncStatusDisplay.format(snapshot).state.label)
-                assertEquals(SyncStatusDisplay.Controls(consent, false, true), SyncStatusDisplay.controls(snapshot))
+                val state = if (!gate) SyncStatusDisplay.State.GATED
+                    else if (consent) SyncStatusDisplay.State.WAITING else SyncStatusDisplay.State.OFF
+                assertEquals(state, SyncStatusDisplay.format(snapshot).state)
+                assertEquals(SyncStatusDisplay.Controls(gate || consent, gate && consent, true), SyncStatusDisplay.controls(snapshot))
             }
             assertEquals(consent, fixture.values["sync_enabled"])
             assertEquals(0, fixture.writes)

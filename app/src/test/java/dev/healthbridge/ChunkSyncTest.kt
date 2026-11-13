@@ -61,14 +61,17 @@ class ChunkSyncTest {
         assertEquals(0, h.collectCalls)
         assertTrue(h.sent.isEmpty())
     }
-    @Test fun productionFeatureGateDefaultsOffEvenWithConsentOn() {
+    @Test fun productionFeatureGateControlsDeliveryWithConsentOn() {
         val h = harness()
         val consent = true
-        assertEquals(ChunkReason.FLAG_OFF, h.run(enabled = consent && ChunkContracts.freshChunkingEnabled).reason)
-        assertFalse(h.root.exists())
-        assertEquals(0, h.collectCalls)
-        assertTrue(h.sent.isEmpty())
-        assertEquals(0, h.cursors.commits)
+        val gate = ChunkContracts.freshChunkingEnabled
+        val result = h.run(enabled = consent && gate)
+        assertEquals(if (gate) ChunkPhase.DONE else ChunkPhase.PLAN, result.phase)
+        assertEquals(if (gate) ChunkReason.NONE else ChunkReason.FLAG_OFF, result.reason)
+        assertEquals(gate, h.root.exists())
+        assertEquals(if (gate) 1 else 0, h.collectCalls)
+        assertEquals(if (gate) 2 else 0, h.sent.size)
+        assertEquals(if (gate) 1 else 0, h.cursors.commits)
     }
     @Test fun legacyPendingIsByteExactAndAllFieldsUnchanged() {
         val h = harness()

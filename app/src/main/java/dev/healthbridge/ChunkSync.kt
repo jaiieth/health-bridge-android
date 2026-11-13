@@ -20,7 +20,7 @@ internal interface ChunkCursorStore {
 }
 
 internal object ChunkContracts {
-    const val freshChunkingEnabled: Boolean = false
+    const val freshChunkingEnabled: Boolean = true
     val verifiedMapping: VerifiedReceiverMapping = ProductionReceiverMapping()
 }
 
