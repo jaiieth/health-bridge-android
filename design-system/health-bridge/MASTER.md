@@ -4,7 +4,7 @@
 
 | Rule | Contract |
 | --- | --- |
-| Authority | `app/src/main/res/values/colors.xml`, `values-night/colors.xml`, and `values/dimens.xml` are authoritative. This file must match them. `DocTokenParityTest.resourceTablesMatchXml` checks exact token sets and values. |
+| Authority | `app/src/main/res/values/colors.xml`, `values-night/colors.xml`, and `values/dimens.xml` are authoritative. This file must match them. `test:DocTokenParityTest.resourceTablesMatchXml` checks exact token sets and values. |
 | Scope | Verified against the production source as it stands. app/src/test/java/dev/healthbridge/DocFlowParityTest fails the build if a cited class stops existing or a row claims something is unimplemented while the class exists. Ratios use WCAG sRGB relative luminance, rounded to three decimals. L/D means light/dark. |
 
 ## Colours
@@ -80,7 +80,7 @@
 
 | Query | Domain | Returned rule | Current decision and implementation |
 | --- | --- | --- | --- |
-| contrast text | ux | Color Contrast; Contrast Readability | Text minimum 4.5:1; `UiTokenTest.allForegroundsPassBothThemes` |
+| contrast text | ux | Color Contrast; Contrast Readability | Text minimum 4.5:1; `test:UiTokenTest.allForegroundsPassBothThemes` |
 | touch target size | ux | Touch Target Size | Android 48dp; `MainActivity.button`, `input`, `onCreate` switch |
 | form labels error feedback | ux | Form Labels; Submit Feedback | `MainActivity.input` uses labelFor; save listener shows saving and result feedback |
 | visible focus keyboard | ux | Focus States | Focus outline in `MainActivity.input`; platform button focus retained. Runtime focus coverage unverified. |

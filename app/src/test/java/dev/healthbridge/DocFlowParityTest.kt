@@ -15,7 +15,7 @@ class DocFlowParityTest {
         .filter { it.isFile && it.extension in setOf("kt", "java") }
         .flatMap { declaration.findAll(it.readText()).map { match -> match.groupValues[1] } }
         .toSet()
-    private val citationDeclarations = File(root, "app/src").walkTopDown()
+    private val testDeclarations = File(root, "app/src/test").walkTopDown()
         .filter { it.isFile && it.extension in setOf("kt", "java") }
         .flatMap { declaration.findAll(it.readText()).map { match -> match.groupValues[1] } }
         .toSet()
@@ -50,11 +50,13 @@ class DocFlowParityTest {
             val citations = Regex("(?<!`)`([^`\\n]+)`(?!`)").findAll(text).map { it.groupValues[1] }
                 .filter { citation -> citation.none { it.isWhitespace() } }
             val names = citations.flatMap { citation ->
-                identifier.findAll(citation).map { it.value }
+                identifier.findAll(citation).map { it.value to citation }
             }.toSet()
             assertTrue("${citedDocument.relativeTo(root)} must cite source classes", names.isNotEmpty())
-            names.forEach { name ->
-                assertTrue("${citedDocument.relativeTo(root)} cites undeclared source class: $name", name in citationDeclarations)
+            names.forEach { (name, citation) ->
+                val explicitTest = citation.startsWith("test:") || citation.startsWith("app/src/test/")
+                assertTrue("${citedDocument.relativeTo(root)} cites undeclared production class or unmarked test symbol: $name",
+                    if (explicitTest) name in testDeclarations else name in productionDeclarations)
             }
         }
     }
@@ -75,8 +77,8 @@ class DocFlowParityTest {
     @Test fun revisionProvenanceCannotGoStale() {
         val pin = "6ae86f61f520d6ca229d2f40e070410638c908c5"
         val provenanceFiles = setOf("design-system/health-bridge/MASTER.md", "docs/ui-design-rationale.md")
-        val token = Regex("(?<![A-Za-z0-9_])[0-9a-fA-F]{7,40}(?![A-Za-z0-9_])")
-        (provenanceFiles + "docs/ux-flows.md").forEach { path ->
+        val token = Regex("(?<![#A-Za-z0-9_])(?<![0-9]\\.\\.)[0-9a-fA-F]{6,40}(?![A-Za-z0-9_])")
+        (provenanceFiles + setOf("docs/ux-flows.md", "docs/ui-skill-third-query.md")).forEach { path ->
             File(root, path).readLines().forEach { line ->
                 token.findAll(line).forEach { match ->
                     val allowed = path in provenanceFiles && match.value == pin &&
