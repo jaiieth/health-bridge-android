@@ -90,9 +90,9 @@ release also passes with true legacy reservations and no intent.
 
 `Model the Domain` shaped `AttemptIntent`, `AttemptChild`, and `PlannedGeneration`.
 `Prove It Works` shaped the inventory comparisons, fence injections, XML counts,
-and APK signature verification. The user required one implementation owner, so
-architecture exploration and comment review stayed local. The parent review is
-still outstanding.
+and APK signature verification. The implementation brief required one owner, so
+architecture exploration and comment review stayed local. The lead reviewed the
+actual diff and reran the full verification command after the delegate finished.
 
 ## Facts and assumptions
 
@@ -181,3 +181,56 @@ The original three ignored fixtures and historical analysis are byte-identical t
 the base. `sync_enabled` still defaults to false, and scheduling is unchanged.
 #4 and #6 remain OPEN. There is no device verification, no storage reclamation
 solution for new pre-publication leftovers, and no production-readiness claim.
+
+## Independent lead verification
+
+The lead waited for the delegated implementation task to finish before accessing
+or building the checkout. The reviewed source HEAD was
+`fda88c62816a7c7965fff286f46da6d53aa100f4`. The lead then ran
+`./gradlew testDebugUnitTest testReleaseUnitTest lintDebug assembleDebug --rerun-tasks`
+with the repository's JDK 17, Android SDK, and QEMU toolchain environment.
+Gradle reported BUILD SUCCESSFUL and 79 executed tasks. No source changes followed
+that run. This section is a documentation-only follow-up.
+
+The independent XML counts are 298 passed, 0 failed, 0 errors, and 3 skipped in
+each variant, out of 301 tests. Lint has 0 errors, 0 fatal issues, and 11 warnings.
+`assembleDebug` succeeded. The original three gap fixtures remain skipped.
+The lead copied the XML and lint report to `/tmp/hb-gap4-lead-verification`.
+`summary.json` contains the independently computed counts. `gradle.log` records
+the actual run.
+
+The rebuilt APK is `/tmp/hb-gap4-lead-verification/health-bridge-gap4-debug.apk`.
+Its SHA-256 is
+`65d0749c290130cb58feda00aef780c65559e4742d9408c0e2b1d66388756fa7`.
+`apksigner verify --print-certs` succeeds with signer certificate SHA-256
+`d813dfca059eea31840113b9510ac51ced2e63b1ae16104134e4f72a3fd54fa6`.
+This is the lead's rebuild identity, separate from the earlier delegate build.
+
+In both independent test runs,
+`AttemptIntentTest.legacyNoIntentPrepublicationInventoryRetainsExactly` passed.
+The test checks identical paths, lengths, and SHA-256 hashes through three recovery
+passes and zero completed-release callbacks. Source review confirms the existing
+no-manifest branch still returns Retain. This evidence concerns legacy
+pre-publication leftovers. Existing independently authorized legacy completed
+cleanup remains covered by `DoneRetentionTest`; absence of intent does not revoke
+that prior authority.
+
+The lead confirmed that the intent classification branch always returns Retain,
+including after validation fails. It never produces a staging-reclamation result.
+Owned rollback and completed-receipt cleanup still require their pre-existing
+authority. No new intent-only deletion authority was introduced.
+
+The lead also confirmed unchanged protected branch refs, consent and scheduling
+sources, runner and database sources, build configuration, historical analysis,
+and original ignored gap fixtures against the base. Both shared candidate APK
+hashes still match the earlier preservation report. No push, tag, release, or
+shared evidence mutation was performed.
+
+The atomic rename requirement remains conditional on the existing single-writer
+mutex and the platform provider's same-directory behavior. The implementation
+uses `Files.move` without `ATOMIC_MOVE` for no-replacement writes. Passing JVM
+tests do not prove that this operation provides an atomic no-replacement contract
+on Android. An unconditional atomic no-replacement guarantee is therefore not
+established by this implementation or verification. This limitation is outstanding,
+not an accepted change to the requirement. #4 remains OPEN, device behavior is
+unverified, and this branch is not production-ready.
