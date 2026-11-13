@@ -116,5 +116,68 @@ The local probe and provider dump are in
 
 ## Verification
 
-Pending final full-run results. All test data is synthetic JVM data.
-There is no device verification. This work does not establish production readiness.
+The implementation commit is `09aae280fc9ff4d17dd19da6b02cc1e880a4483e`.
+The final documentation commit records these results without changing tested source.
+Verification ran on that source before the implementation commit. All data is
+synthetic JVM data.
+
+Run `scripts/verify-gap4.sh` to repeat the focused and full checks. It creates a
+new directory beneath `/tmp/hb-gap4-verification` for every invocation. The passing
+run is `/tmp/hb-gap4-verification/run-2w49OM`. Its `summary.json` derives the counts
+from the copied XML, and `full.log` records the Gradle task results.
+
+| Check | Passed | Failed | Errors | Skipped |
+| --- | ---: | ---: | ---: | ---: |
+| Focused debug JVM tests | 108 | 0 | 0 | 0 |
+| `testDebugUnitTest` | 298 | 0 | 0 | 3 |
+| `testReleaseUnitTest` | 298 | 0 | 0 | 3 |
+
+Each full variant has 301 tests, including the three unchanged ignored gap
+fixtures. The change adds 18 attempt-intent tests and three completed-cleanup tests
+to the 277 passing baseline. `lintDebug` reports 0 errors, 0 fatal issues, and 11
+warnings. `assembleDebug` succeeds. The full verification command is
+`./gradlew --no-daemon testDebugUnitTest testReleaseUnitTest lintDebug assembleDebug`.
+
+The build APK is `app/build/outputs/apk/debug/app-debug.apk`. A byte-identical copy
+is `/tmp/hb-gap4-verification/run-2w49OM/health-bridge-gap4-debug.apk`.
+
+- APK SHA-256 is `3a918e02c3744a8d1c06a6374e657a8281bc68aadb58eb25803d0f38dd763554`.
+- The verified signer certificate SHA-256 is `d813dfca059eea31840113b9510ac51ced2e63b1ae16104134e4f72a3fd54fa6`.
+- `apksigner verify --print-certs` succeeds. The signer matches the original candidate.
+
+`AttemptIntentTest.bodyCrashesPreserveByteExactDurableIntentForListAndStreaming`
+compares the exact bytes captured after the intent directory fence with the file
+after the first body's TEMP_WRITTEN and DIRECTORY_SYNCED crashes. It also checks
+zero sends, zero cursor commits, absent publication, and repeated unchanged
+retention. The fence matrix covers every intent write boundary in both routes,
+with process death and caught I/O failure. The directory fsync failure has a
+separate fault injection.
+
+`AttemptIntentTest.legacyNoIntentPrepublicationInventoryRetainsExactly` writes a
+true legacy reservation and no intent. Three recovery passes return the existing
+Retain behavior and compare every file path, length, and SHA-256 with the original
+inventory. Synthetic legacy Pending and cursor files, bodies, and a partial temp
+stay unchanged. The common retention assertion also invokes completed cleanup and
+checks zero release callbacks. `StagingRecoveryTest` continues to exercise legacy
+manifest-authorized reclamation. `DoneRetentionTest` covers completed cleanup for
+both protocols and interrupted removal of the new metadata.
+
+`preservation.json` in the passing evidence directory records equal base and
+working Git blob IDs for the historical analysis, original ignored fixtures,
+Store, Containment, worker, consent controls, production adapter, runner, and build
+configuration. It also records the exact skipped test names and unchanged shared
+candidate APK hashes. Both shared candidate APKs remain
+`cd224c87618edd2a0e7f5d287ce218541d6ea8ac6227718dd492421d2a67bf96`.
+No shared evidence file was written or deleted.
+
+The actual protected refs were checked before and after verification.
+`hb/phase23-integration` remains
+`947fad21910c19a83ed9d745f892d1a339922b9a`.
+`hb/v0.1.1-gate-candidate` remains
+`3be5bd332b3fc94382dea917c883b3a1300e81de`.
+The working branch stays `hb/gap4-attempt-intent`.
+
+The original three ignored fixtures and historical analysis are byte-identical to
+the base. `sync_enabled` still defaults to false, and scheduling is unchanged.
+#4 and #6 remain OPEN. There is no device verification, no storage reclamation
+solution for new pre-publication leftovers, and no production-readiness claim.
