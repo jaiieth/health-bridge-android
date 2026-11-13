@@ -60,7 +60,7 @@ scripts/check-gap4-preservation.sh
 scripts/summarize-gap4-extension.py /tmp/hb-gap4-addendum/verified
 ```
 
-The first restoration run found 12 expectation failures, preserved at
+The first restoration run had 303 passed, 12 failed, 3 skipped, preserved at
 `/tmp/hb-gap4-addendum/reversion-first.log` and `reversion-first-xml`. They expected
 new intent-bearing attempts to be removed. Those expectations contradicted the
 required base allowlist restoration. The subsequent full gate passed, with raw log
@@ -107,3 +107,33 @@ Production limits, control reserve, consent, scheduling, signer, application ID,
 version and production dependencies remain unchanged. Published v0.1.1 context is
 accepted from the owner; it was not reverified or modified. No shared evidence was
 removed or overwritten. No independent review has been assigned or certified.
+
+## Dedicated blocker results
+
+The #4 reproduction reports 2 passed, 0 failed, 0 skipped, with raw log and XML
+at `/tmp/hb-gap-reproduction-2vqbPC/`.
+The #6 reproduction reports 0 passed, 1 failed, 0 skipped. Its failure is
+`originalNewestThreeAdmissionFixture`, expected DONE but got BLOCKED. Raw log,
+XML and summary are `/tmp/hb-gap-reproduction-KGWD4Z/`. The wrapper name is the authoritative XML failure name.
+
+## Final collection note
+
+The offline gate also returned BUILD SUCCESSFUL, 85 actionable tasks, in
+`/tmp/hb-gap4-addendum/offline-gate.log`. Its debug XML reports 324 passed,
+0 failed, 0 skipped. Before release XML could be copied, concurrent external
+activity replaced the build directory. The result collector therefore failed
+with `No XML results for testReleaseUnitTest`; its partial output must not be
+presented as a complete summary. The earlier full gate release XML is preserved
+in `/tmp/hb-gap4-addendum/full-release-xml`, with 324 passed, 0 failed, 0 skipped.
+Both preserved full-suite counts are in `full-gate-summary.json`.
+
+HEAD changed externally from 37a115d to
+f2ced272567dcf2d26b0196a7181bc131995479d during collection. That commit captured
+the source and test edits already exercised by this run. No further production
+edit was made after detecting this activity. This report records the evidence
+rather than claiming exclusive ownership of the shared build directory.
+
+The copied debug APK is `/tmp/hb-gap4-addendum/verified/health-bridge-gap4-debug.apk`.
+SHA-256 is `3e49a1feb217ca8651d88408055559620cbb6025934bb7e5a6cf49a75d00a10a`.
+Signer certificate SHA-256 is
+`d813dfca059eea31840113b9510ac51ced2e63b1ae16104134e4f72a3fd54fa6`.
