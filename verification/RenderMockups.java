@@ -41,10 +41,11 @@ public class RenderMockups {
             label("Your health data. Your destination.",24,84,18,"muted",false);
             label("DESIGN RENDER NOT DEVICE SCREENSHOT",24,112,14,"muted",false);
             card(136,382,"Sync control");
-            label("Sync OFF",44,216,26,"text",true);
-            g.setColor(colors.get("off"));g.fillRect(46,237,16,16);
-            label("OFF · Automatic sync is off",76,253,18,"off",true);
-            label("Switch, setup and read access are required.",44,285,17,"muted",false);
+            label("Saved health consent: OFF",44,216,22,"on_disabled",true);
+            g.setColor(colors.get("paused"));g.fillRect(46,237,16,16);
+            label("Build gated",76,253,18,"paused",true);
+            label("Health sync unavailable in this build -",44,278,16,"muted",false);
+            label("resource safety pending",44,298,16,"muted",false);
             button("Health work unavailable",304,true);
             label("Progress ready. No health delivery progress.",44,389,18,"muted",false);
             label("Last successful health sync",44,435,18,"text",true);

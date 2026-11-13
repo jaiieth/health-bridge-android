@@ -54,7 +54,8 @@
 
 | State | Colour | Text and symbol contract |
 | --- | --- | --- |
-| OFF | `hb_off` | OFF and stop icon |
+| GATED | `hb_paused` | Build gated and pause icon; resource-safety reason; saved consent shown separately with OFF available |
+| OFF | `hb_off` | OFF and stop icon when the build gate is enabled |
 | WAITING | `hb_waiting` | ON, waiting / paused and clock icon |
 | PAUSED | `hb_paused` | Paused and pause icon |
 | BLOCKED | `hb_blocked` | Blocked and warning icon |

@@ -6,16 +6,17 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SyncControlTest {
-    internal class Fixture(enabled: Boolean) {
+    internal class Fixture(enabled: Boolean, freshChunkingEnabled: Boolean = true) {
         val values = mutableMapOf<String, Any>("sync_enabled" to enabled, "minutes" to 75L)
         val calls = mutableListOf<String>()
+        var writes = 0
         private val staged = mutableMapOf<String, Any>()
         private val editor: SharedPreferences.Editor = Proxy.newProxyInstance(
             javaClass.classLoader, arrayOf(SharedPreferences.Editor::class.java)
         ) { proxy, method, args ->
             when (method.name) {
                 "putBoolean", "putString", "putLong" -> { staged[args!![0] as String] = args[1]; proxy }
-                "commit" -> { values.putAll(staged); staged.clear(); true }
+                "commit" -> { writes++; values.putAll(staged); staged.clear(); true }
                 else -> error(method.name)
             }
         } as SharedPreferences.Editor
@@ -35,7 +36,44 @@ class SyncControlTest {
                 assertEquals(false, values["sync_enabled"])
                 calls += "cancel"
             }
-        })
+        }, freshChunkingEnabled)
+    }
+
+    @Test fun gatedBuildRefusesEnableWithoutWritingConsentOrScheduling() {
+        val fixture = Fixture(false, freshChunkingEnabled = false)
+        assertFalse(fixture.control.setEnabled(true))
+        assertEquals(false, fixture.values["sync_enabled"])
+        assertEquals(emptyList<String>(), fixture.calls)
+        assertEquals(0, fixture.writes)
+    }
+
+    @Test fun gatedBuildKeepsSavedConsentUntilExplicitOff() {
+        val fixture = Fixture(true, freshChunkingEnabled = false)
+        assertEquals(true, fixture.values["sync_enabled"])
+        assertEquals(0, fixture.writes)
+        assertEquals(emptyList<String>(), fixture.calls)
+        assertTrue(fixture.control.setEnabled(false))
+        assertEquals(false, fixture.values["sync_enabled"])
+        assertEquals(listOf("cancel"), fixture.calls)
+        assertEquals(1, fixture.writes)
+        assertFalse(fixture.control.setEnabled(true))
+        assertEquals(false, fixture.values["sync_enabled"])
+        assertEquals(listOf("cancel"), fixture.calls)
+        assertEquals(1, fixture.writes)
+    }
+
+    @Test fun gatedRenderingPreservesBothConsentValuesWithoutWritesOrScheduling() {
+        listOf(false, true).forEach { consent ->
+            val fixture = Fixture(consent, freshChunkingEnabled = false)
+            repeat(2) {
+                val snapshot = SyncStatusDisplay.Snapshot(fixture.settings.syncEnabled, true, true)
+                assertEquals("Build gated", SyncStatusDisplay.format(snapshot).state.label)
+                assertEquals(SyncStatusDisplay.Controls(consent, false, true), SyncStatusDisplay.controls(snapshot))
+            }
+            assertEquals(consent, fixture.values["sync_enabled"])
+            assertEquals(0, fixture.writes)
+            assertEquals(emptyList<String>(), fixture.calls)
+        }
     }
 
     @Test fun openingWithEitherStoredPreferenceDoesNoWork() {

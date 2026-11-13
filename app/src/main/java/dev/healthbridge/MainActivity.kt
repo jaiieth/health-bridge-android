@@ -73,14 +73,16 @@ class MainActivity : ComponentActivity() {
         text(page, "Health Bridge", R.dimen.hb_type_title, bold = true)
         text(page, "Sync is OFF by default. Save your setup, then use Send test to send an empty batch. Health delivery is paused during containment.")
 
+        val initial = SyncStatusDisplay.Snapshot(enabled, false, false)
         val sync = card(page, "Sync control")
         control = Switch(this).apply {
             isSaveEnabled = false
-            text = if (enabled) "Sync ON" else "Sync OFF"
-            isChecked = enabled
-            setTextColor(color(R.color.hb_text))
+            text = SyncStatusDisplay.consentLabel(initial)
+            isEnabled = SyncStatusDisplay.controls(initial).consentEnabled
+            isChecked = initial.enabled
+            setTextColor(ColorStateList(arrayOf(intArrayOf(-android.R.attr.state_enabled), intArrayOf()), intArrayOf(color(R.color.hb_on_disabled), color(R.color.hb_text))))
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, resources.getDimension(R.dimen.hb_type_section))
-            thumbTintList = ColorStateList.valueOf(color(R.color.hb_primary))
+            thumbTintList = ColorStateList(arrayOf(intArrayOf(-android.R.attr.state_enabled), intArrayOf()), intArrayOf(color(R.color.hb_on_disabled), color(R.color.hb_primary)))
             trackTintList = ColorStateList.valueOf(color(R.color.hb_disabled))
             minHeight = dim(R.dimen.hb_touch_min)
             minimumWidth = dim(R.dimen.hb_touch_min)
@@ -91,15 +93,17 @@ class MainActivity : ComponentActivity() {
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
         sync.addView(stateIcon, LinearLayout.LayoutParams(dim(R.dimen.hb_space_lg), dim(R.dimen.hb_space_lg)))
-        status = text(sync, "Loading recorded state…")
+        status = text(sync, if (initial.freshChunkingEnabled) "Loading recorded state…"
+            else "${SyncStatusDisplay.State.GATED.label}. ${SyncStatusDisplay.buildUnavailableReason}")
         status.accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         syncNow = button(sync, "Record paused health status") {
-            if (enabled) {
+            if (enabled && ChunkContracts.freshChunkingEnabled) {
                 Schedule.manual(this)
                 refresh()
             }
         }
-        syncNow.isEnabled = enabled
+        syncNow.isEnabled = SyncStatusDisplay.controls(initial).manualEnabled
+        if (!initial.freshChunkingEnabled) syncNow.text = SyncStatusDisplay.buildUnavailableReason
         text(sync, "Progress", bold = true)
         progress = text(sync, SyncStatusDisplay.progress())
         text(sync, "Last successful health sync", bold = true)
@@ -161,7 +165,7 @@ class MainActivity : ComponentActivity() {
                         } else {
                             runCatching {
                                 syncControl.save(requireNotNull(url), secret, requireNotNull(interval))
-                                "Settings saved. Sync remains ${if (enabled) "ON" else "OFF"}."
+                                "Settings saved. ${SyncStatusDisplay.consentLabel(SyncStatusDisplay.Snapshot(enabled, false, false))}."
                             }.getOrDefault("Could not save settings. Try again.")
                         }
                     }
@@ -211,7 +215,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     if (!ok) setupMessage.setText(R.string.control_save_failed)
-                    control.isEnabled = true
+                    control.isEnabled = enabled || ChunkContracts.freshChunkingEnabled
                     refresh()
                 }
             }
@@ -246,12 +250,13 @@ class MainActivity : ComponentActivity() {
                 }
                 val s = snapshot.first
                 val display = SyncStatusDisplay.format(s)
+                val controls = SyncStatusDisplay.controls(s)
                 val stateColor = color(when (display.state) {
                     SyncStatusDisplay.State.OFF -> R.color.hb_off
                     SyncStatusDisplay.State.BLOCKED -> R.color.hb_blocked
                     SyncStatusDisplay.State.DONE, SyncStatusDisplay.State.PARTIAL -> R.color.hb_waiting
                     SyncStatusDisplay.State.IO_FAILURE -> R.color.hb_blocked
-                    SyncStatusDisplay.State.PAUSED -> R.color.hb_paused
+                    SyncStatusDisplay.State.PAUSED, SyncStatusDisplay.State.GATED -> R.color.hb_paused
                     SyncStatusDisplay.State.WAITING -> R.color.hb_waiting
                     SyncStatusDisplay.State.UNKNOWN -> R.color.hb_unknown
                 })
@@ -262,21 +267,23 @@ class MainActivity : ComponentActivity() {
                     SyncStatusDisplay.State.BLOCKED -> R.drawable.ic_warning
                     SyncStatusDisplay.State.DONE, SyncStatusDisplay.State.PARTIAL -> R.drawable.ic_clock
                     SyncStatusDisplay.State.IO_FAILURE -> R.drawable.ic_warning
-                    SyncStatusDisplay.State.PAUSED -> R.drawable.ic_pause
+                    SyncStatusDisplay.State.PAUSED, SyncStatusDisplay.State.GATED -> R.drawable.ic_pause
                     SyncStatusDisplay.State.WAITING -> R.drawable.ic_clock
                     SyncStatusDisplay.State.UNKNOWN -> R.drawable.ic_help
                 })
                 stateIcon.imageTintList = ColorStateList.valueOf(stateColor)
                 changingControl = true
                 control.isChecked = s.enabled
-                control.text = if (s.enabled) "Sync ON" else "Sync OFF"
+                control.text = SyncStatusDisplay.consentLabel(s)
+                control.isEnabled = controls.consentEnabled
                 changingControl = false
-                syncNow.isEnabled = s.enabled && s.configured && s.permissions
-                sendTest.isEnabled = s.configured
+                syncNow.isEnabled = controls.manualEnabled
+                sendTest.isEnabled = controls.testEnabled
                 testStatus.accessibilityLiveRegion = if (s.result.startsWith("BLOCKED:") || s.result.contains(": RETRY") || s.result.contains(": BLOCKED")) View.ACCESSIBILITY_LIVE_REGION_ASSERTIVE else View.ACCESSIBILITY_LIVE_REGION_POLITE
                 progress.text = SyncStatusDisplay.progress(s.result)
                 testStatus.text = SyncStatusDisplay.testResult(s.result)
-                syncNow.text = if (syncNow.isEnabled) "Record paused health status" else "Health work unavailable: check switch, setup and access"
+                syncNow.text = if (!s.freshChunkingEnabled) SyncStatusDisplay.buildUnavailableReason
+                else if (syncNow.isEnabled) "Record paused health status" else "Health work unavailable: check switch, setup and access"
                 sendTest.text = if (sendTest.isEnabled) "Send test" else "Send test unavailable: save endpoint and token"
                 lastSync.text = SyncStatusDisplay.lastSuccess(s.lastSuccess, Instant.now(), ZoneId.systemDefault())
                 permissionStatus.text = snapshot.second

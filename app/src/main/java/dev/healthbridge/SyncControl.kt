@@ -5,8 +5,13 @@ interface SyncScheduler {
     fun cancel()
 }
 
-class SyncControl(private val settings: Settings, private val scheduler: SyncScheduler) {
+class SyncControl(
+    private val settings: Settings,
+    private val scheduler: SyncScheduler,
+    private val freshChunkingEnabled: Boolean = ChunkContracts.freshChunkingEnabled,
+) {
     fun setEnabled(enabled: Boolean): Boolean {
+        if (enabled && !freshChunkingEnabled) return false
         settings.syncEnabled = enabled
         if (settings.syncEnabled != enabled) return false
         if (enabled) scheduler.schedule(settings.minutes) else scheduler.cancel()

@@ -11,7 +11,7 @@ object SyncStatusDisplay {
     enum class State(val label: String, val icon: String) {
         DONE("Acknowledged", "check"), PARTIAL("In progress / partial", "clock"),
         IO_FAILURE("Storage failure", "warning"), OFF("OFF", "stop"), BLOCKED("Blocked", "warning"), PAUSED("Paused", "pause"),
-        WAITING("ON, waiting / paused", "clock"), UNKNOWN("Unknown", "help")
+        WAITING("ON, waiting / paused", "clock"), UNKNOWN("Unknown", "help"), GATED("Build gated", "pause")
     }
     data class Display(val state: State, val reason: String, val action: String)
     data class Snapshot(
@@ -21,7 +21,22 @@ object SyncStatusDisplay {
         val result: String = "Ready",
         val lastSuccess: String = "Never",
         val pending: Boolean = false,
+        val freshChunkingEnabled: Boolean = ChunkContracts.freshChunkingEnabled,
     )
+
+    const val buildUnavailableReason = "Health sync unavailable in this build - resource safety pending"
+
+    data class Controls(val consentEnabled: Boolean, val manualEnabled: Boolean, val testEnabled: Boolean)
+
+    fun controls(s: Snapshot) = Controls(
+        consentEnabled = s.freshChunkingEnabled || s.enabled,
+        manualEnabled = s.freshChunkingEnabled && s.enabled && s.configured && s.permissions,
+        testEnabled = s.configured,
+    )
+
+    fun consentLabel(s: Snapshot): String = if (s.freshChunkingEnabled)
+        if (s.enabled) "Sync ON" else "Sync OFF"
+    else if (s.enabled) "Saved health consent: ON (turn OFF)" else "Saved health consent: OFF"
 
     private data class Recorded(val phase: ChunkPhase, val index: Int, val total: Int, val reason: ChunkReason)
 
@@ -76,6 +91,9 @@ object SyncStatusDisplay {
     }
 
     fun format(s: Snapshot): Display = when {
+        !s.freshChunkingEnabled -> Display(State.GATED, buildUnavailableReason,
+            if (s.enabled) "Consent is saved. This build cannot deliver health data yet. You can turn saved consent OFF. Send test remains separate."
+            else "Saved consent is OFF. Enabling health sync is unavailable. Send test remains separate.")
         !s.enabled -> Display(State.OFF, "Automatic sync is off. Retained data is kept.", "An already active empty test may finish. Send test is separate from health sync.")
         s.result == "BLOCKED: empty Test acceptance unknown; no automatic retry" -> Display(State.BLOCKED, "Empty test acceptance is unknown. Health delivery remains paused.", "No automatic retry will run. Check the receiver before another explicit test.")
         s.result == "Health sync PAUSED: containment stage" -> Display(State.PAUSED, "Health sync is paused during containment.", "ON records your preference. It does not deliver health data.")

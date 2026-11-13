@@ -7,7 +7,40 @@ import org.junit.Test
 
 class SyncStatusDisplayTest {
     private fun snapshot(enabled: Boolean = true, result: String = "Ready") =
-        SyncStatusDisplay.Snapshot(enabled, true, true, result)
+        SyncStatusDisplay.Snapshot(enabled, true, true, result, freshChunkingEnabled = true)
+
+    @Test fun closedBuildGateIsDistinctFromSavedConsentAndRecordedResults() {
+        listOf(false, true).forEach { consent ->
+            listOf("Ready", "Health sync PLAN: 0/0; FLAG_OFF", "Health sync DONE: 1/1; NONE",
+                "Health sync PAUSED: legacy Pending preserved; delivery blocked").forEach { result ->
+                val display = SyncStatusDisplay.format(snapshot(consent, result).copy(freshChunkingEnabled = false))
+                assertEquals("Build gated", display.state.label)
+                assertEquals("Health sync unavailable in this build - resource safety pending", display.reason)
+                assertTrue(display.action.contains(if (consent) "Consent is saved" else "Saved consent is OFF"))
+            }
+        }
+    }
+
+    @Test fun gatedControlsAllowOnlyConsentOffAndKeepConfiguredTestAvailable() {
+        for (consent in listOf(false, true)) for (configured in listOf(false, true))
+            for (permissions in listOf(false, true)) for (pending in listOf(false, true)) {
+                val s = SyncStatusDisplay.Snapshot(consent, configured, permissions, pending = pending)
+                assertEquals(SyncStatusDisplay.Controls(consent, false, configured), SyncStatusDisplay.controls(s))
+                assertEquals(if (consent) "Saved health consent: ON (turn OFF)" else "Saved health consent: OFF",
+                    SyncStatusDisplay.consentLabel(s))
+                assertEquals(consent, s.enabled)
+            }
+    }
+
+    @Test fun gateEnabledControlsRetainExistingRequirements() {
+        for (consent in listOf(false, true)) for (configured in listOf(false, true))
+            for (permissions in listOf(false, true)) {
+                val s = snapshot(consent).copy(configured = configured, permissions = permissions)
+                assertEquals(SyncStatusDisplay.Controls(true, consent && configured && permissions, configured),
+                    SyncStatusDisplay.controls(s))
+                assertEquals(if (consent) "Sync ON" else "Sync OFF", SyncStatusDisplay.consentLabel(s))
+            }
+    }
 
     @Test fun recordedChunkStatusesAreRecognized() {
         data class Case(val phase: String, val reason: String, val state: SyncStatusDisplay.State, val label: String)
