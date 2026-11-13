@@ -15,6 +15,9 @@ internal const val STAGE_HEADROOM_BYTES = 1_048_576L
 internal const val OUTBOX_HARD_QUOTA_BYTES = 64L * 1024 * 1024
 internal const val OUTBOX_CONTROL_QUOTA_BYTES = 64L * 1024
 private const val CONTROL_RECORD_BYTES = 2048
+internal const val RETAINED_DONE_GENERATIONS = 3
+internal const val COMPLETED_RECEIPT_COUNT = 16
+internal enum class ReleaseBoundary { TOMBSTONE_DURABLE, BODY_REMOVED, BODIES_SYNCED, METADATA_REMOVED, MANIFEST_REMOVED, GENERATION_REMOVED, PARENT_SYNCED }
 
 internal class ChunkBudgetExceeded(val reason: ChunkReason) : RuntimeException()
 
@@ -98,6 +101,7 @@ internal class ChunkOutbox(
     private val root: File,
     private val files: DurableFiles = DurableFiles(),
     private val usableSpace: (File) -> Long = { it.usableSpace },
+    private val releaseFault: (ReleaseBoundary, String) -> Unit = { _, _ -> },
 ) {
     private fun generation(value: String): File {
         require(value.matches(Regex("[a-zA-Z0-9-]{1,100}")))
@@ -285,6 +289,180 @@ internal class ChunkOutbox(
 
     fun retainedBytes(): Long = if (!root.exists()) 0 else root.walkTopDown().onFail { _, error -> throw error }.filter { it.isFile && !isControl(it) }
         .fold(0L) { total, file -> Math.addExact(total, Files.size(file.toPath())) }
+
+    private data class Receipt(
+        val generation: String, val fingerprint: String, val endpointHash: String,
+        val targets: Map<String, String>, val chunkCount: Int, val totalBytes: Long,
+        val contentHash: String, val completedAt: Long, val manifestHash: String,
+    )
+
+    private fun receiptFile(id: String) = File(root, "receipt-$id.json")
+    private fun receiptBytes(receipt: Receipt): ByteArray = with(receipt) {
+        JSONObject().apply {
+            put("format", "health-bridge-completed-v1"); put("generation", generation)
+            put("fingerprint", fingerprint); put("endpointHash", endpointHash)
+            put("targets", JSONObject(targets)); put("chunkCount", chunkCount)
+            put("totalBytes", totalBytes); put("contentHash", contentHash)
+            put("completedAt", completedAt); put("manifestHash", manifestHash)
+        }.toString().toByteArray(Charsets.UTF_8).also { require(it.size <= CONTROL_RECORD_BYTES) }
+    }
+
+    private fun readReceipt(file: File): Receipt? = try {
+        require(file.isFile && file.length() <= CONTROL_RECORD_BYTES)
+        val j = JSONObject(file.readText())
+        require(j.getString("format") == "health-bridge-completed-v1" && j.length() == 10)
+        val id = j.getString("generation")
+        generation(id)
+        require(file.name == receiptFile(id).name)
+        val targets = j.getJSONObject("targets").let { o -> o.keys().asSequence().associateWith { o.getString(it) } }
+        require(targets.isNotEmpty() && targets.size <= 6 && targets.keys.all { it in freshTypeNames })
+        require(targets.values.all { it.length <= 40 && runCatching { java.time.Instant.parse(it) }.isSuccess })
+        val receipt = Receipt(id, j.getString("fingerprint"), j.getString("endpointHash"), targets,
+            j.getInt("chunkCount"), j.getLong("totalBytes"), j.getString("contentHash"),
+            j.getLong("completedAt"), j.getString("manifestHash"))
+        require(listOf(receipt.fingerprint, receipt.endpointHash, receipt.contentHash, receipt.manifestHash).all { it.matches(Regex("[0-9a-f]{64}")) })
+        require(receipt.chunkCount in 1..100 && receipt.totalBytes >= 0 && receipt.completedAt >= 0)
+        receipt
+    } catch (_: Exception) { null }
+
+    private fun referencedGenerations(): Set<String> {
+        val ids = mutableSetOf<String>()
+        for (name in listOf("active", "active.tmp", "active-proof", "active-proof.tmp", "previous", "previous.tmp")) {
+            val pointer = File(root, name)
+            if (!pointer.exists()) continue
+            require(pointer.isFile && pointer.length() <= CONTROL_RECORD_BYTES)
+            val lines = pointer.readLines()
+            ids += if (name.removeSuffix(".tmp") == "active") pointer.readText() else lines.getOrNull(1) ?: error("UNKNOWN_POINTER")
+        }
+        return ids
+    }
+
+    private fun recognisedMetadata(dir: File, id: String, fingerprint: String, current: ChunkManifest? = null): Boolean = try {
+        val publication = File(dir, "published.json")
+        if (publication.exists()) {
+            require(publication.isFile && publication.length() <= FreshGenerationLimits().manifestBytes)
+            val initial = decode(publication.readText())
+            require(initial.generation == id && initial.fingerprint == fingerprint && initial.phase == ChunkPhase.STAGE && initial.reason == ChunkReason.NONE)
+            require(initial.fingerprint == parentFingerprint(initial.endpointHash, initial.recordIds, initial.recordHashes, initial.targets))
+            require(initial.children.none { it.acked || it.sentAt != null || it.ackedAt != null })
+            if (current != null) require(initial.children.map { listOf(it.index, it.batchId, it.bodySha, it.count) } ==
+                current.children.map { listOf(it.index, it.batchId, it.bodySha, it.count) })
+        }
+        val reservation = File(dir, "reservation")
+        if (reservation.exists()) {
+            require(reservation.isFile && reservation.length() <= 256)
+            val fields = reservation.readLines()
+            require(fields.size == 7 && fields[0] == "1" && fields[1] == id)
+            val retained = fields[2].toLong(); val bodies = fields[3].toLong(); val bound = fields[4].toLong()
+            val peak = fields[5].toLong(); val limit = fields[6].toLong()
+            require(retained >= 0 && bodies >= 0 && bound in 1..8L * 1024 * 1024 && limit in 0..OUTBOX_HARD_QUOTA_BYTES)
+            require(peak == Math.addExact(retained, Math.addExact(bodies, 3 * bound + 256)) && peak <= limit)
+        }
+        true
+    } catch (_: Exception) { false }
+
+    private fun completedManifest(dir: File): ChunkManifest? = try {
+        require(dir.isDirectory && generation(dir.name) == dir)
+        val file = File(dir, "manifest.json")
+        require(file.isFile && file.length() <= FreshGenerationLimits().manifestBytes)
+        val m = decode(file.readText())
+        require(m.generation == dir.name && m.phase == ChunkPhase.DONE && m.reason == ChunkReason.NONE)
+        require(m.targets.isNotEmpty() && m.targets.size <= 6 && m.targets.keys.all { it in freshTypeNames })
+        require(m.targets.values.all { it.length <= 40 && runCatching { java.time.Instant.parse(it) }.isSuccess })
+        require(m.fingerprint == parentFingerprint(m.endpointHash, m.recordIds, m.recordHashes, m.targets))
+        require(m.endpointHash.matches(Regex("[0-9a-f]{64}")) && m.recordIds.size == m.recordHashes.size)
+        require(m.children.size in 1..100 && m.children.map { it.index } == m.children.indices.toList())
+        require(m.children.map { it.batchId }.distinct().size == m.children.size)
+        require(m.children.sumOf { it.count } == m.recordIds.size && m.updatedAt >= 0)
+        require(m.children.all { it.acked && it.sentAt != null && it.ackedAt != null && receiverBatchId.matches(it.batchId) })
+        val allowed = setOf("manifest.json", "published.json", "reservation") + m.children.map { "child-${it.index}.json" }
+        require(dir.listFiles()!!.all { it.isFile && it.name in allowed })
+        require(recognisedMetadata(dir, m.generation, m.fingerprint, m))
+        m
+    } catch (_: Exception) { null }
+
+    private fun makeReceipt(m: ChunkManifest): Receipt {
+        val digest = MessageDigest.getInstance("SHA-256")
+        var bytes = 0L
+        m.children.forEach { child ->
+            val file = bodyFile(m, child.index)
+            require(file.isFile && file.length() <= FRESH_RECORD_BYTES)
+            require(sha256(file.readBytes()) == child.bodySha)
+            bytes = Math.addExact(bytes, file.length())
+            digest.update(child.bodySha.toByteArray(Charsets.US_ASCII))
+        }
+        val contentHash = digest.digest().joinToString("") { "%02x".format(it.toInt() and 255) }
+        return Receipt(m.generation, m.fingerprint, m.endpointHash, m.targets, m.children.size, bytes,
+            contentHash, m.updatedAt, sha256(File(generation(m.generation), "manifest.json").readBytes()))
+    }
+
+    private fun admitReceipt(receipt: Receipt): Boolean {
+        val target = receiptFile(receipt.generation)
+        if (target.exists()) return readReceipt(target) == receipt
+        val records = root.listFiles()!!.filter { it.name.matches(Regex("receipt-[a-zA-Z0-9-]{1,100}\\.json")) }
+        if (records.size >= COMPLETED_RECEIPT_COUNT) {
+            val referenced = referencedGenerations()
+            val old = records.mapNotNull { file -> readReceipt(file)?.let { file to it } }
+                .filter { (_, r) -> !generation(r.generation).exists() && r.generation !in referenced }
+                .minWithOrNull(compareBy<Pair<File, Receipt>> { it.second.completedAt }.thenBy { it.second.generation }) ?: return false
+            Files.delete(old.first.toPath())
+            files.sync(root)
+        }
+        writeControl(target, receiptBytes(receipt), replace = false)
+        return true
+    }
+
+    private suspend fun release(receipt: Receipt, cursors: ChunkCursorStore) {
+        val dir = generation(receipt.generation)
+        if (!dir.exists() || receipt.generation in referencedGenerations()) return
+        if (cursors.hasLegacyPending() || !cursors.committed(receipt.targets)) return
+        val entries = dir.listFiles() ?: throw IOException("DIRECTORY_LIST_FAILED")
+        val allowed = setOf("manifest.json", "published.json", "reservation") + (0 until receipt.chunkCount).map { "child-$it.json" }
+        if (entries.any { !it.isFile || it.name !in allowed }) return
+        val manifestFile = File(dir, "manifest.json")
+        val m = if (manifestFile.exists()) completedManifest(dir) ?: return else null
+        if (m != null && (sha256(manifestFile.readBytes()) != receipt.manifestHash || m.fingerprint != receipt.fingerprint ||
+                m.targets != receipt.targets || m.children.size != receipt.chunkCount)) return
+        if (m == null && entries.any { it.name.startsWith("child-") }) return
+        if (!recognisedMetadata(dir, receipt.generation, receipt.fingerprint, m)) return
+        // Fence the already-written receipt again on restart before releasing a single body.
+        files.sync(root)
+        releaseFault(ReleaseBoundary.TOMBSTONE_DURABLE, receipt.generation)
+        if (m != null) for (child in m.children) {
+            val body = bodyFile(m, child.index)
+            if (body.exists()) {
+                if (sha256(body.readBytes()) != child.bodySha) return
+                Files.delete(body.toPath())
+                releaseFault(ReleaseBoundary.BODY_REMOVED, receipt.generation)
+            }
+        }
+        files.sync(dir)
+        releaseFault(ReleaseBoundary.BODIES_SYNCED, receipt.generation)
+        // The manifest survives until every body is gone. A receipt alone recovers metadata removal.
+        for (name in listOf("published.json", "reservation", "manifest.json")) {
+            Files.deleteIfExists(File(dir, name).toPath())
+            releaseFault(if (name == "manifest.json") ReleaseBoundary.MANIFEST_REMOVED else ReleaseBoundary.METADATA_REMOVED, receipt.generation)
+        }
+        Files.delete(dir.toPath())
+        releaseFault(ReleaseBoundary.GENERATION_REMOVED, receipt.generation)
+        files.sync(root)
+        releaseFault(ReleaseBoundary.PARENT_SYNCED, receipt.generation)
+    }
+
+    suspend fun reclaimDone(cursors: ChunkCursorStore) {
+        if (!root.isDirectory || cursors.hasLegacyPending()) return
+        // A receipt is durable release authority, never a reason to collect or send a body again.
+        val receipts = root.listFiles()!!.mapNotNull(::readReceipt)
+        for (receipt in receipts.sortedWith(compareBy<Receipt> { it.completedAt }.thenBy { it.generation })) release(receipt, cursors)
+        val candidates = root.listFiles()!!.mapNotNull(::completedManifest)
+        val proven = candidates.filter { cursors.committed(it.targets) }
+            .sortedWith(compareByDescending<ChunkManifest> { it.updatedAt }.thenByDescending { it.generation })
+        for (m in proven.drop(RETAINED_DONE_GENERATIONS)) {
+            if (m.generation in referencedGenerations() || cursors.hasLegacyPending()) continue
+            val receipt = try { makeReceipt(m) } catch (_: Exception) { continue }
+            if (admitReceipt(receipt)) release(receipt, cursors)
+        }
+    }
 
     private fun preflight(required: Long) {
         val directory = generateSequence(root.absoluteFile) { it.parentFile }.firstOrNull { it.isDirectory }

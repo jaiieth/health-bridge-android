@@ -15,6 +15,8 @@ internal interface ChunkCursorStore {
     suspend fun hasLegacyPending(): Boolean
     /** Must check Pending and replace all targets in one transaction. False means Pending exists. */
     suspend fun commit(targets: Map<String, String>): Boolean
+    /** Read durable cursor values. Implementations without this proof cannot authorize retention. */
+    suspend fun committed(targets: Map<String, String>): Boolean = false
 }
 
 internal object ChunkContracts {
@@ -39,6 +41,11 @@ internal class ChunkSync(
     ): ChunkStatus {
         if (!enabled) return ChunkStatus(ChunkPhase.PLAN, reason = ChunkReason.FLAG_OFF)
         if (cursors.hasLegacyPending()) return ChunkStatus(ChunkPhase.BLOCKED, reason = ChunkReason.LEGACY_PENDING)
+        try { outbox.reclaimDone(cursors) } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE)
+        }
         var manifest = try { outbox.load()?.takeUnless { it.phase == ChunkPhase.DONE } } catch (_: IOException) {
             return ChunkStatus(ChunkPhase.PAUSED, reason = ChunkReason.IO_FAILURE)
         } catch (_: Exception) {
@@ -134,6 +141,7 @@ internal class ChunkSync(
             if (!cursors.commit(current.targets)) return stop(current, ChunkPhase.BLOCKED, ChunkReason.LEGACY_PENDING)
             current = current.copy(phase = ChunkPhase.DONE, updatedAt = clock())
             outbox.save(current)
+            outbox.reclaimDone(cursors)
             return current.status()
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e

@@ -17,6 +17,13 @@ internal fun chunkOutbox(context: Context): ChunkOutbox = ChunkOutbox(
 internal suspend fun runFreshChunkSync(context: Context, store: Store, settings: Settings): ChunkStatus {
     val cursorStore = object : ChunkCursorStore {
         override suspend fun hasLegacyPending() = store.pending() != null
+        override suspend fun committed(targets: Map<String, String>): Boolean {
+            val saved = store.cursors().associate { it.type to it.until }
+            return targets.all { (type, until) ->
+                val actual = saved[type] ?: return@all false
+                try { !Instant.parse(actual).isBefore(Instant.parse(until)) } catch (_: Exception) { false }
+            }
+        }
         override suspend fun commit(targets: Map<String, String>) = store.commitChunkCursors(targets.map { Cursor(it.key, it.value) })
     }
     val runner = ChunkSync(chunkOutbox(context), cursorStore, send = { batchId, body ->

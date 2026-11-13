@@ -17,7 +17,7 @@ There are two disjoint content-byte budgets.
 - Controls are capped at 65,536 bytes. Only root-level active, active-proof, previous,
   backpressure, receipt files and their temps are controls. Each record is at most
   2048 bytes. Atomic writes check existing control bytes plus the new copy before writing.
-  Stage B will cap receipt count as well. Unknown contents are not silently deleted.
+  Stage B caps receipt count at 16. Unknown contents are not silently deleted.
 
 Payload admission computes `R = retainedPayload + bodyBytes + 3 * manifestBound + 256`.
 The three manifest copies cover immutable `published.json`, current `manifest.json`,
@@ -83,13 +83,59 @@ instead of deleting it after a reported I/O failure. It does not promise zero gr
 that publication boundary. Pre-publication body/manifest IOException fixtures prove
 zero payload growth and previous-pointer preservation.
 
-## Stage B status at the Stage A commit
+## Stage B retention
 
-The owner authorized keeping the three newest proven-DONE generations in full and
-writing a durable tombstone before deleting older bodies. That ordering resolves the
-previous byte-total recovery gap. Retention is not yet implemented in this Stage A commit.
-There is no deletion of DONE, pending, unacked, UNKNOWN_ACCEPTANCE, legacy Pending,
-or unrecognised generations in Stage A. Stage B requires its own commit and crash tests.
+The owner-approved policy keeps the three newest recognised, proven-DONE generations
+in full. Ranking uses persisted DONE `updatedAt`, then generation ID for a deterministic
+timestamp tie. It never assumes a random directory is delivered. Unknown, corrupt,
+pending, unacked, UNKNOWN_ACCEPTANCE, and pointer-referenced generations are not
+pruned. A legacy Pending in the database blocks reclamation entirely.
+
+`ChunkCursorStore.committed` defaults to false. The production adapter reads committed
+Room cursor rows and requires every current cursor to cover the generation target.
+This proof is checked before initial release and again when resuming a receipt. DONE,
+NONE stop reason, all persisted ACK identities/timestamps, valid fingerprint, child
+indices/counts, exact known filenames, and body hashes must also pass. ACK flags are
+trusted only as application-owned durable state written after the unchanged ACK
+validator. External forgery of private application files is not a supported proof model.
+
+Before deleting a body, a bounded root receipt is atomically written and directory-synced.
+Its exact fields are format, generation, fingerprint, endpointHash, targets, chunkCount,
+totalBytes, contentHash, completedAt, and manifestHash. `targets` is the committed cursor
+map. `totalBytes` is the original sum of body-file byte lengths. `contentHash` is SHA-256
+of the ordered concatenation of each child's fixed-length ASCII body SHA-256.
+`completedAt` is persisted DONE updatedAt. `manifestHash` binds the complete DONE
+manifest, including ACK metadata. Each receipt is at most 2048 bytes and contains no
+payload or record-ID list.
+
+At most 16 completed receipts are retained. Before adding a seventeenth, the oldest
+valid receipt whose generation directory is already absent and is not pointer-referenced
+is removed and the parent is synced. A receipt for an in-progress release is never
+retired. Unknown receipts are never evicted. This explicitly bounds local history;
+older pruned history is not retained indefinitely. The 64 KiB control cap independently
+includes all receipt and pointer atomic coexistence. With 16 maximum-sized receipts,
+their replacement/new temp and the bounded pointer/refusal records fit this cap.
+
+The three retained generations remain in payload accounting during every future
+admission. Cleanup creates only control bytes and monotonically removes payload bytes;
+it never discounts prospective reclamation from a reservation before deletion happens.
+Extra unrecognised or unproven generations can remain beyond the three proven completions.
+They still count toward quota and can safely cause backpressure.
+
+| Stage B restart point | Safe state |
+| --- | --- |
+| Before receipt rename or its directory fsync | All bodies remain. The receipt is regenerated or fenced before deletion. |
+| Receipt durable, no body removed | Receipt contains the original byte total and hashes. Cursor and legacy checks run again. |
+| Between individual body removals | DONE manifest and receipt remain. Remaining bodies must match their hashes before idempotent removal. |
+| Bodies removed and generation directory synced | Receipt proves delivery. Generation metadata can be removed. |
+| During publication/reservation metadata removal | DONE manifest still exists and binds the receipt. Cleanup resumes. |
+| DONE manifest removed, generation directory remains | No bodies can remain after the earlier directory fence. The durable receipt authorizes removal of the empty/known metadata directory. |
+| Generation removed before parent fsync | Receipt remains. Restart safely handles an absent or reappearing already-released directory. |
+| Parent fsync complete | Three full completions plus bounded receipts remain. Repeated runs leave identical inventories. |
+
+No migration, receiver work, sync enabling, database schema change, or legacy Pending
+mutation is introduced. The strict earlier body-before-tombstone order was superseded
+by the owner's tombstone-first decision. Retention is implemented only in Stage B.
 
 Stage A verification used the preinstalled toolchain from scripts/verify.sh.
 `./gradlew --no-daemon testDebugUnitTest --rerun-tasks` reported `BUILD SUCCESSFUL in 52s`.
@@ -97,3 +143,24 @@ JUnit XML totals were 243 tests, zero failures, errors, or skips, including all 
 method identities. `./gradlew --no-daemon lintDebug` reported `BUILD SUCCESSFUL in 50s`
 and `0 errors, 11 warnings`. `./gradlew --no-daemon clean assembleDebug` reported
 `BUILD SUCCESSFUL in 28s`. Evidence is saved in `/tmp/hb-v3-stage-a-*`.
+
+Stage B verification used the same preinstalled toolchain.
+`./gradlew --no-daemon testDebugUnitTest --rerun-tasks` reported `BUILD SUCCESSFUL in 1m`.
+JUnit XML totals were 251 tests, zero failures, errors, or skips, including all 230 baseline
+method identities. `./gradlew --no-daemon lintDebug` reported `BUILD SUCCESSFUL in 53s`
+and `0 errors, 11 warnings`. `./gradlew --no-daemon clean assembleDebug` reported
+`BUILD SUCCESSFUL in 28s`. Evidence is saved in `/tmp/hb-v3-stage-b-*`.
+
+OutboxAdmissionTest covers quota boundaries, near-budget escaping, retained pending bytes,
+partial temporary body/manifest failures, stable refusal inventories, same-reservation
+retry, unknown-file preservation, and pointer-rename crash/fallback. DoneRetentionTest
+covers N=3 retention, literal tombstone hashes/byte totals, every release boundary,
+every atomic tombstone boundary, cursor/legacy proof rechecks, corrupt metadata,
+receipt caps, both budgets at atomic peaks, and safe clearing of quota backpressure.
+Existing durability and containment tests remain in the forced full runs. Assertions
+that required orphan retention or mislabeled quota/manifest refusals as OVERSIZED were
+updated to the newly authorized behavior; their test identities were retained.
+
+Keeping three large full completions can itself leave insufficient space for a new
+generation. The approved policy then requires backpressure rather than evicting one
+of those three or exceeding the payload quota. No automatic policy override is added.
