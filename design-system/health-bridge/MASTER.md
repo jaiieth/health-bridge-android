@@ -5,7 +5,7 @@
 | Rule | Contract |
 | --- | --- |
 | Authority | `app/src/main/res/values/colors.xml`, `values-night/colors.xml`, and `values/dimens.xml` are authoritative. This file must match them. `DocTokenParityTest.resourceTablesMatchXml` checks exact token sets and values. |
-| Scope | Resource and code reference at b387fea. Ratios use WCAG sRGB relative luminance, rounded to three decimals. L/D means light/dark. |
+| Scope | Verified against the production source as it stands. app/src/test/java/dev/healthbridge/DocFlowParityTest fails the build if a cited class stops existing or a row claims something is unimplemented while the class exists. Ratios use WCAG sRGB relative luminance, rounded to three decimals. L/D means light/dark. |
 
 ## Colours
 
@@ -72,8 +72,9 @@
 | Item | Evidence or limitation |
 | --- | --- |
 | Skill repository | Local `/home/ubuntu/tools/ui-ux-pro-max-skill`, commit `6ae86f61f520d6ca229d2f40e070410638c908c5` |
-| CLI | CLI package `ui-ux-pro-max-cli 2.5.0` from `cli/package.json`; repository commit `6ae86f61f520d6ca229d2f40e070410638c908c5` dated 2026-11-10; no other version string is declared, and an earlier 2.15.0 claim is withdrawn as unverified. |
+| CLI | CLI package `ui-ux-pro-max-cli 2.5.0` from `cli/package.json`; repository commit `6ae86f61f520d6ca229d2f40e070410638c908c5` dated 2026-11-10; no separate skill version is declared. |
 | Scoped searches | Six offline searches run for this documentation pass through `.claude/skills/ui-ux-pro-max/scripts/search.py`, each with `-n 2`; queries below are exact. They explain applicable rules, not historical generation of this UI. |
+| Third scoped query set | [Nine additional offline scoped searches](../../docs/ui-skill-third-query.md), with exact commands, returned rules, and source-backed adaptations. |
 | Not skill output | Layout composition, exact palette, and section order are manual choices. Exact dimension values and native system sans are repository choices. No generated font or layout recommendation is claimed as implemented. |
 
 | Query | Domain | Returned rule | Current decision and implementation |

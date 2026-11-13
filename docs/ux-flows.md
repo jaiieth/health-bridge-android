@@ -1,6 +1,6 @@
 # Health Bridge flows and states
 
-This matrix describes source HEAD cc6f552. Chunk delivery is integrated but compile-time gated OFF by `ChunkContracts.freshChunkingEnabled=false`. Citations below use file aliases with exact symbols. They describe source behavior, not device verification.
+Verified against the production source as it stands. app/src/test/java/dev/healthbridge/DocFlowParityTest fails the build if a cited class stops existing or a row claims something is unimplemented while the class exists. Chunk delivery is integrated but compile-time gated OFF by `ChunkContracts.freshChunkingEnabled=false`. Citations below use file aliases with exact symbols. They describe source behavior, not device verification.
 
 | Alias | File |
 | --- | --- |
