@@ -29,8 +29,8 @@ class AttemptBoundaryTest(private val boundary: String) {
 
     companion object {
         @JvmStatic @Parameterized.Parameters(name = "{0}") fun boundaries() = listOf(
-            "B0", "B1", "B2", "B3", "B4", "B5", "B6_manifest", "B6_referenced", "B7",
-            "B8_first_ack", "B8_all_acks", "B8_before_commit", "B8_after_commit",
+            "B0_temp", "B0_fsync", "B0_rename", "B0", "B1_temp", "B1", "B2", "B3", "B4", "B5", "B6_manifest", "B6_referenced", "B7",
+            "B8_first_ack", "B8_all_acks", "B8_before_commit", "B8_after_commit", "B8_done",
         ).map { arrayOf(it) }
     }
 
@@ -45,6 +45,11 @@ class AttemptBoundaryTest(private val boundary: String) {
         fun phase() = root.walkTopDown().firstOrNull { it.name == "manifest.json" }?.let { JSONObject(it.readText()) }
         val files = DurableFiles(fault = { at, name ->
             val kill = when (boundary) {
+                "B0_temp" -> name == "reservation" && at == DurableBoundary.TEMP_WRITTEN
+                "B0_fsync" -> name == "reservation" && at == DurableBoundary.FILE_SYNCED
+                "B0_rename" -> name == "reservation" && at == DurableBoundary.RENAMED
+                "B1_temp" -> name == ATTEMPT_INTENT_NAME && at == DurableBoundary.TEMP_WRITTEN
+                "B8_done" -> name == "manifest.json" && at == DurableBoundary.DIRECTORY_SYNCED && phase()?.getString("phase") == "DONE"
                 "B0" -> name == "reservation" && at == DurableBoundary.DIRECTORY_SYNCED
                 "B1" -> name == ATTEMPT_INTENT_NAME && at == DurableBoundary.FILE_SYNCED
                 "B2" -> name == ATTEMPT_INTENT_NAME && at == DurableBoundary.RENAMED
@@ -78,14 +83,16 @@ class AttemptBoundaryTest(private val boundary: String) {
         catch (_: ProcessDeath) { }
         val before = retainedInventory(root)
         val generation = root.listFiles()!!.single { it.isDirectory }
-        assertTrue(File(generation, "reservation").isFile)
-        assertEquals(boundary !in setOf("B0", "B1"), File(generation, ATTEMPT_INTENT_NAME).isFile)
-        assertEquals(boundary == "B1", File(generation, "$ATTEMPT_INTENT_NAME.tmp").isFile)
+        assertEquals(boundary !in setOf("B0_temp", "B0_fsync"), File(generation, "reservation").isFile)
+        assertEquals(boundary in setOf("B0_temp", "B0_fsync"), File(generation, "reservation.tmp").isFile)
+        assertEquals(boundary !in setOf("B0_temp", "B0_fsync", "B0_rename", "B0", "B1_temp", "B1"), File(generation, ATTEMPT_INTENT_NAME).isFile)
+        assertEquals(boundary in setOf("B1_temp", "B1"), File(generation, "$ATTEMPT_INTENT_NAME.tmp").isFile)
         if (boundary == "B4") assertEquals("partial", File(generation, "child-1.json.tmp").readText())
         val beforeSends = if (ledger.exists()) ledger.readLines().size else 0
-        val expectedSends = when (boundary) { "B7", "B8_first_ack" -> 1; "B8_all_acks", "B8_before_commit", "B8_after_commit" -> 2; else -> 0 }
+        val expectedSends = when (boundary) { "B7", "B8_first_ack" -> 1; "B8_all_acks", "B8_before_commit", "B8_after_commit", "B8_done" -> 2; else -> 0 }
         assertEquals(expectedSends, beforeSends)
         val expectedPhase = when (boundary) {
+            "B8_done" -> ChunkPhase.DONE
             "B6_referenced" -> ChunkPhase.STAGE
             "B7" -> ChunkPhase.SEND
             "B8_first_ack", "B8_all_acks" -> ChunkPhase.ACK
@@ -100,7 +107,7 @@ class AttemptBoundaryTest(private val boundary: String) {
             assertEquals(expectedPhase, restarted.load()?.phase)
         }
         val originalPayloads = before.filterKeys { it.endsWith(".json") && (it.contains("child-") || it.endsWith(ATTEMPT_INTENT_NAME)) }
-        if (expectedPhase != null) {
+        if (expectedPhase != null && expectedPhase != ChunkPhase.DONE) {
             val restartSend: suspend (String, ByteArray) -> ChunkResponse = { batch, body ->
                 ledger.appendText("$batch ${sha256(body)}\n")
                 ChunkResponse(200, "{\"ok\":true,\"batchId\":\"$batch\"}")
@@ -122,6 +129,10 @@ class AttemptBoundaryTest(private val boundary: String) {
             val sent = ledger.readLines()
             assertEquals(sent.map { it.substringBefore(' ') }.distinct().size, sent.size)
             originalPayloads.forEach { (name, value) -> assertEquals(value, retainedInventory(root)[name]) }
+        } else if (expectedPhase == ChunkPhase.DONE) {
+            assertEquals(ChunkPhase.DONE, ChunkOutbox(root).status()!!.phase)
+            assertEquals(2, beforeSends)
+            assertTrue(DiskTestCursors(cursorFile).committed(input.targetCursors))
         } else {
             assertEquals(0, beforeSends)
             assertFalse(cursorFile.exists())

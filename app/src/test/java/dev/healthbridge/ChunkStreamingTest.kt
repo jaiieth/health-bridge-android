@@ -409,9 +409,10 @@ class ChunkStreamingTest {
                 assertEquals("$name $boundary", ChunkReason.IO_FAILURE, status.reason)
                 assertNotNull(failed)
                 assertEquals(0, writesAfter)
-                if (name == "active" && boundary in listOf(DurableBoundary.RENAMED, DurableBoundary.DIRECTORY_SYNCED)) {
-                    assertEquals(failed, snapshot(folder))
-                } else assertTrue(snapshot(folder).isEmpty())
+                assertEquals(failed, snapshot(folder))
+                val retained = snapshot(folder)
+                ChunkOutbox(folder).recoverStaging()
+                assertEquals(retained, snapshot(folder))
                 assertEquals(0, cursors.commits)
             }
         }
@@ -425,7 +426,10 @@ class ChunkStreamingTest {
             assertThrows(IOException::class.java) { stage(outbox, input(listOf(record(0)))) }
             assertEquals(failureAt + 1, probes)
             assertNull(outbox.load())
-            assertEquals(0, folder.walkTopDown().count { it.name == "child-0.json" })
+            assertEquals(if (failureAt == 2) 1 else 0, folder.walkTopDown().count { it.name == "child-0.json" })
+            val retained = snapshot(folder)
+            ChunkOutbox(folder).recoverStaging()
+            assertEquals(retained, snapshot(folder))
         }
     }
 

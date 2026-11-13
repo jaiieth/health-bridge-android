@@ -1,8 +1,10 @@
 # Gap 4 retention policy design
 
-**FOR REVIEW, NOT IMPLEMENTATION.** Independent review is unassigned.
+**FOR REVIEW ONLY. NOT IMPLEMENTATION APPROVAL.** Independent review is unassigned.
 This document grants no deletion, reclamation, overwrite, unpin, or release authority.
-The extension changes tests, test configuration, reproduction scripts, and documents only.
+The addendum restores completed cleanup and rollback allowlists to base behavior.
+All proposed reclamation remains design and test-only. Durable attempt-intent is
+PROVENANCE, not deletion authority.
 #4 and #6 remain OPEN. This is not production-ready and has no device verification.
 
 ## Premises and limits
@@ -86,7 +88,9 @@ with the visible files preserved, not actual power loss or filesystem rollback.
 
 | Boundary | Surviving evidence | Current outcome and permitted action |
 | --- | --- | --- |
+| B0 temp/fsync/rename | Reservation temp or final before its directory fence | Retain; release nothing; no intent, body or send. |
 | B0 | Durable reservation, no intent temp | Retain; release nothing; no send occurred. |
+| B1 temp | Complete written intent temp before file fsync | Retain; release nothing; no body or send. |
 | B1 | Fsynced intent temp, no final intent | Retain; release nothing; no body or send. |
 | B2 | Renamed intent, directory fence incomplete | Retain; release nothing; no body or send. |
 | B3 | Durable intent, no bodies | Retain; release nothing; plan alone is insufficient. |
@@ -99,6 +103,7 @@ with the visible files preserved, not actual power loss or filesystem rollback.
 | B8 all ACKs | All ACKs durable, no COMMIT | Retain; resume commit without another send. |
 | B8 before commit | COMMIT durable, cursor transaction not called | Retain; retry cursor commit, no send. |
 | B8 after commit | Cursor test file written, DONE not durable | Retain; retry idempotent commit, no send. |
+| B8 DONE | Durable DONE and cursor file | DONE status; intent metadata remains retained under base cleanup. |
 
 Each case runs three recovery passes with fresh instances and checks identical
 file inventories before resuming. Successful resume checks original payload and
@@ -107,7 +112,7 @@ pause and checks the transport count stays one. These are finite observed paths,
 not a universal proof against every possible duplicate delivery.
 
 The existing `DoneRetentionTest.restartsEveryReleaseBoundaryWithNoDanglingPointerOrPendingLoss`
-and `releaseRestartsAfterIntentAndReservationMetadataRemoval` are reused for
+is reused with explicitly synthetic legacy generations for
 B8's independently authorized completed-release intervals. They inject every
 existing release boundary and reopen the same directory with a fresh outbox.
 No release implementation is added by this extension.
@@ -151,9 +156,9 @@ verify every input using regular-file, no-symlink, bounded reads. Any unreadable
 root entry or malformed reference stops the decision.
 
 The eligible generation file set is exactly `reservation`, `attempt-intent.json`,
-zero or more of the four existing manifest/publication final/temp names, and
-exactly one final or temp basename per planned child. No unknown entries,
-reservation temp, intent temp, duplicate child name, missing child, subdirectory,
+optional final `manifest.json` and `published.json`, and
+exactly one final basename per planned child. No unknown entries,
+any in-flight temp, reservation temp, intent temp, duplicate child name, missing child, subdirectory,
 symlink, partial body, or mismatched digest is eligible. Every child length and
 SHA-256 must equal the immutable plan. Ordered record IDs, hashes, target cursors,
 endpoint hash, generation, attempt ID, writer version, reservation fields,
@@ -185,9 +190,9 @@ reservation SHA-256, parent fingerprint, inventory row count. Then come sorted
 rows of `basename<TAB>decimalLength<TAB>sha256<NEWLINE>`. Only the exact ASCII
 basenames above are accepted. Generation is at most 100 ASCII characters, UUID
 is 36 characters, each digest is 64 lowercase hex characters, and row count is
-at most 106. A row is at most 106 bytes by the conservative 32-character filename,
+at most 104. A row is at most 106 bytes by the conservative 32-character filename,
 7-digit length, 64-character digest, two tabs, and newline bounds. Headers and
-106 rows fit below 16,384 bytes. No record IDs or cursor strings are copied;
+104 rows fit below 16,384 bytes. No record IDs or cursor strings are copied;
 the immutable intent digest binds them. Exact row count and trailing EOF are
 mandatory. The filename is `orphan-release-<generation>.txt`, with `.tmp` during
 creation. Unknown versions or a second conflicting authorization stop release.
@@ -243,7 +248,8 @@ within the unchanged finite quota while retaining all pinned bytes.
 - JVM process-death injection does not simulate device power loss, fsync behavior,
   torn storage writes, multiple OS processes, or disk controller failures.
 - Cursor test doubles in outbox tests establish runner behavior only. Real Room
-  tests use the generated DAO and SQLite, with reopen and trigger-induced rollback.
+  tests use the generated DAO and SQLite, with reopen, trigger-induced rollback, and native JVM subprocess halts inside
+  both actual DAO transactions.
   They do not establish Android process-kill durability or production integration.
 - Store.success rollback is not evidence of atomic cursor and status writes in
   FreshChunkSync, whose status write is outside commitChunkCursors.
@@ -256,3 +262,73 @@ within the unchanged finite quota while retaining all pinned bytes.
 - Record content uses synthetic data only. No real health data or device is used.
 - Published v0.1.1 facts supplied by the owner are accepted context and are not
   reverified. Protected branches, tag, release, signing, consent, and infra are untouched.
+
+## Addendum evidence and mandatory stop conditions
+
+This section supersedes earlier stage reports that said new intent-bearing DONE
+metadata could be released. The entire completed-cleanup section is restored to
+base 3be5bd3, including reference parsing and eligible-file allowlists. Its allowlist
+excludes attempt-intent.json and its reservation parser accepts legacy arithmetic.
+Consequently even five new DONE generations remain retained, with no receipt or
+release callback, across repeated fresh instances. Existing legacy completed-release
+boundary tests use synthetic legacy-format reservations and retain base behavior.
+Legacy pre-publication fixtures still classify Retain and remain byte-identical.
+
+An independent no-send proof would have to establish this complete chain before
+any proposed byte release: reservation file fsync, rename, directory fsync; intent
+file fsync, no-replacement rename, directory fsync; each body fence; manifest and
+publication fences; authenticated pointer fences; durable SEND before transport;
+ACK after response; COMMIT before Room cursor transaction; durable cursor proof;
+DONE and completed receipt for the existing completed path. Missing SEND is not
+independent evidence unless the writer ordering and survival of delivery evidence
+are independently established under the particular failure. Current tests observe
+finite process-restart paths, not that universal invariant.
+
+Partial intent, partial body temp, intent without reservation, mismatched fingerprint
+or record IDs, crash between intent and first body, rename before directory fsync,
+and ambiguous send are insufficient evidence. All remain retained. A missing receipt
+blocks the existing completed release path. No new orphan authority exists.
+
+Every proposed release must stop on active generation pin, previous/rollback pin,
+active-proof or any pointer reference, in-flight temp, malformed/unparsable reference,
+missing receipt on the completed path, absent durable cursor proof, Pending present,
+or mutex/queue non-idle. An unmet pin means BLOCKED-with-diagnosis. It never means
+implicit unpin or partial release. Absence of Pending must be checked against the
+real durable store under exclusive ownership, not inferred from intent.
+
+Measured synthetic cost under the unchanged 67,108,864-byte quota:
+
+| Completed attempt | Reservation bytes | Actual intent bytes | M bound | I bound | Added peak 2I | Manifest copies 3M | Controls after | File fsync calls | Directory fsync calls |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 48 | 12140 | 21438 | 54206 | 108412 | 64314 | 95 | 134 | 136 |
+| 2 | 56 | 12148 | 21438 | 54206 | 108412 | 64314 | 181 | 135 | 137 |
+| 3 | 57 | 12149 | 21438 | 54206 | 108412 | 64314 | 181 | 135 | 137 |
+
+Control records are bounded at 2,048 bytes each and 4,096 bytes for an atomic
+write pair. Active IDs are at most 100 bytes; active-proof encoding is at most
+177 bytes under its generation/hash/time bounds. Completed receipts remain at
+most 16 records of 2,048 bytes each. These fit within the existing control accounting,
+not an additional quota. No new receipt is produced for these intent-bearing DONE
+generations after base restoration. Directory fsync has no encoded-content byte
+charge in logical quota arithmetic; filesystem journal/block cost and latency are
+unmeasured. Adding intent adds one file fsync, one rename and one directory fsync.
+
+Persisting intent adds exactly `2 * attemptIntentBudget(manifest)` to reservation
+peak, reducing payload headroom by 108,412 bytes in each large attempt above.
+For the three-large-DONE case, new retained bytes are 65,632,801 versus a synthetic
+legacy-format counterfactual of 65,596,364, a 36,437-byte retained increase.
+The next body plan is 2,080,404 bytes, M=5,901 and I=38,669. Its old peak is
+67,694,908 and new peak is 67,808,683, worse by 113,775 bytes, comprising retained
+overhead and 77,338 extra reserved intent bytes. Both exceed quota. Actual fourth
+admission returns OUTBOX_QUOTA and zero sends. This test shows no forward progress.
+The restored allowlist adds the named blocker `intent-metadata-ineligible-for-base-DONE-release`
+even beyond the newest-three rule. No change to that rule or its constant is implemented.
+
+The boundary matrix additionally splits reservation temp-write, file-fsync and
+rename before B0, intent temp-write before B1 fsync, and B8 durable DONE. These
+are 18 parameter cases. A fresh instance reopens the same directory at each one.
+Room tests separately halt a native subprocess with exit 73 after the first cursor
+write inside commitChunkCursors, and after Pending deletion/cursor write before
+status insertion inside success. The pre-halt marker is file-fsynced. Reopen must
+restore the old committed state. This proves observed SQLite transaction recovery
+on this host, not device power-loss durability or fresh-sync status atomicity.

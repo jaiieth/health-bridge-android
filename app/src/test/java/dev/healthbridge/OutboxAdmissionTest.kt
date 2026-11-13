@@ -82,7 +82,7 @@ class OutboxAdmissionTest {
         assertNull(outbox.backpressure(explicitRetry = true))
     }
 
-    @Test fun bodyAndManifestIoFailuresRollbackOnlyOwnedFiles() {
+    @Test fun bodyAndManifestIoFailuresRetainOwnedIntentAndAllPartialBytes() {
         for (name in listOf("child-0.json", "manifest.json")) {
             val root = temporary.newFolder()
             File(root, "active").writeText("previous")
@@ -104,9 +104,12 @@ class OutboxAdmissionTest {
                     outbox.publishReserved(r, m)
                 } catch (e: IOException) { outbox.rollback(attempt); throw e }
             }
-            assertEquals(before, inventory(root))
+            before.forEach { (path, bytes) -> assertEquals(bytes, inventory(root)[path]) }
+            val retained = inventory(root)
+            assertTrue(retained.keys.any { it.endsWith(ATTEMPT_INTENT_NAME) })
+            assertTrue(retained.keys.any { it.endsWith("$name.tmp") })
             outbox.rollback(attempt)
-            assertEquals(before, inventory(root))
+            assertEquals(retained, inventory(root))
         }
     }
 
@@ -135,7 +138,7 @@ class OutboxAdmissionTest {
         assertEquals(m.copy(updatedAt = 1), outbox.load())
     }
 
-    @Test fun changedSourceRollsBackAndPreservesPreexistingPendingInventory() {
+    @Test fun changedSourceRetainsIntentAndPreservesPreexistingPendingInventory() {
         val root = temporary.newFolder()
         File(root, "legacy-Pending-unknown").writeText("never touch")
         val before = inventory(root)
@@ -147,10 +150,14 @@ class OutboxAdmissionTest {
         assertThrows(IllegalStateException::class.java) { runBlocking {
             StreamingChunkPlanner(ChunkOutbox(root), syntheticMapping, ChunkLimits(), { "change-${id++}" }, { 0 }).stage(input, sha256("endpoint".toByteArray()))
         } }
-        assertEquals(before, inventory(root))
+        before.forEach { (path, bytes) -> assertEquals(bytes, inventory(root)[path]) }
+        val retained = inventory(root)
+        assertTrue(retained.keys.any { it.endsWith(ATTEMPT_INTENT_NAME) })
+        assertNull(ChunkOutbox(root).recoverStaging())
+        assertEquals(retained, inventory(root))
     }
 
-    @Test fun sameReservationRetriesAfterRolledBackFailureWithoutDuplicateBodies() {
+    @Test fun sameReservationRefusesRetryWithoutOverwritingRetainedAttempt() {
         val root = temporary.newFolder()
         var fail = true
         val outbox = ChunkOutbox(root, DurableFiles(fault = { boundary, name ->
@@ -161,18 +168,16 @@ class OutboxAdmissionTest {
         val attempt = outbox.beginReserved(r, m, listOf(4L))
         assertThrows(IOException::class.java) { outbox.stageReservedBody(r, 0, "body".toByteArray(), 4) }
         outbox.rollback(attempt)
-        assertEquals(0L, outbox.retainedBytes())
+        val retained = inventory(root)
+        assertTrue(outbox.retainedBytes() > 0)
         fail = false
-        outbox.beginReserved(r, m, listOf(4L))
-        outbox.stageReservedBody(r, 0, "body".toByteArray(), 4)
-        outbox.publishReserved(r, m)
-        assertEquals(1, root.walkTopDown().count { it.name == "child-0.json" })
-        assertEquals(r.peak.toString(), File(root, "generation/reservation").readLines()[5])
-        ChunkOutbox(root).save(m)
-        assertEquals(r.peak.toString(), File(root, "generation/reservation").readLines()[5])
+        assertThrows(IllegalStateException::class.java) { outbox.beginReserved(r, m, listOf(4L)) }
+        assertEquals(retained, inventory(root))
+        assertNull(ChunkOutbox(root).recoverStaging())
+        assertEquals(retained, inventory(root))
     }
 
-    @Test fun cleanupCrashLeavesIgnoredOrphanAndNeverTouchesUnknownOrActiveFiles() {
+    @Test fun rollbackDoesNotEnterDeletionForIntentOrTouchUnknownOrActiveFiles() {
         val root = temporary.newFolder()
         File(root, "active").writeText("previous")
         val pending = File(root, "previous").apply { mkdir() }
@@ -188,7 +193,7 @@ class OutboxAdmissionTest {
         val attempt = outbox.beginReserved(r, m, listOf(4L))
         outbox.stageReservedBody(r, 0, "body".toByteArray(), 4)
         crash = true
-        assertThrows(ProcessDeath::class.java) { outbox.rollback(attempt) }
+        outbox.rollback(attempt)
         val after = inventory(root)
         before.forEach { (path, content) -> assertEquals(content, after[path]) }
         // A restarted instance has no ownership token and leaves this unpublished directory alone.
@@ -197,7 +202,8 @@ class OutboxAdmissionTest {
         assertEquals(after, inventory(root))
         crash = false
         outbox.rollback(attempt)
-        assertEquals(before, inventory(root))
+        assertEquals(after, inventory(root))
+        assertTrue(File(root, "generation/$ATTEMPT_INTENT_NAME").isFile)
     }
 
     @Test fun rollbackNeverRemovesCommitDoneUnknownAcceptanceOrUnknownFiles() {

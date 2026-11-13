@@ -204,7 +204,7 @@ class AttemptIntentTest {
                 if (injectAfterSync && boundary == DurableBoundary.FILE_SYNCED && name == ATTEMPT_INTENT_NAME) target.writeBytes(existing)
             })
             assertThrows(if (injectAfterSync) FileAlreadyExistsException::class.java else IllegalStateException::class.java) {
-                files.write(target, "replacement".toByteArray(), replace = false)
+                files.write(target, "replacement".toByteArray(), replace = false, exclusiveTemp = true)
             }
             assertArrayEquals(existing, target.readBytes())
         }
@@ -252,6 +252,7 @@ class AttemptIntentTest {
             { it.remove("format") }, { it.put("extra", true) }, { it.put("format", "unknown") },
             { it.put("writerProtocol", 2) }, { it.put("createdAt", "1700") }, { it.put("reservationBytes", 1) },
             { it.put("reservationSha", "0".repeat(64)) }, { it.put("fingerprint", "0".repeat(64)) },
+            { it.getJSONArray("recordIds").put(0, "conflicting-record") },
             { it.getJSONArray("children").getJSONObject(0).put("extra", 1) },
             { it.getJSONArray("children").getJSONObject(0).remove("bodySha") },
             { it.getJSONArray("children").getJSONObject(0).put("finalName", "../outside") },
@@ -283,6 +284,7 @@ class AttemptIntentTest {
             { File(it, "unknown").writeText("unknown") },
             { File(it, "reservation").appendText("\n") },
             { File(it, "reservation").writeText("malformed") },
+            { File(it, "reservation").delete() },
             { File(it, ATTEMPT_INTENT_NAME).delete() },
             { File(it, "$ATTEMPT_INTENT_NAME.tmp").writeBytes(File(it, ATTEMPT_INTENT_NAME).readBytes()) },
         )

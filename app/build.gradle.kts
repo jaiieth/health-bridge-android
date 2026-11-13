@@ -23,7 +23,14 @@ android {
     testOptions {
         unitTests.isIncludeAndroidResources = true
         unitTests.all {
-            it.systemProperty("robolectric.dependency.repo.url", "https://repo.maven.apache.org/maven2")
+            val unit = it
+            unit.systemProperty("robolectric.dependency.repo.url", "https://repo.maven.apache.org/maven2")
+            unit.exclude("**/RoomCrashProcess\$Child.class")
+            unit.doFirst { unit.systemProperty("hb.test.runtime.classpath", unit.classpath.asPath) }
+            providers.environmentVariable("HB_ROBOLECTRIC_SDK_DIR").orNull?.let { directory ->
+                unit.systemProperty("robolectric.offline", "true")
+                unit.systemProperty("robolectric.dependency.dir", directory)
+            }
         }
     }
     lint {
@@ -49,11 +56,29 @@ dependencies {
     testImplementation("org.json:json:20240303")
 }
 
-val compileGapReproductions = tasks.register<JavaCompile>("compileGapReproductions") {
+val gapFixtureClasses = layout.buildDirectory.dir("classes/gapFixtures")
+val compileGapFixtures = tasks.register<JavaExec>("compileGapFixtures") {
     val unit = tasks.named<Test>("testDebugUnitTest")
     dependsOn("compileDebugUnitTestKotlin")
+    classpath = configurations.getByName("kotlinCompilerClasspath")
+    mainClass.set("org.jetbrains.kotlin.cli.jvm.K2JVMCompiler")
+    val sources = fileTree("src/gapReproduction/kotlin") { include("**/*.kt") }
+    inputs.files(sources, unit.map { it.classpath }, unit.map { it.testClassesDirs })
+    outputs.dir(gapFixtureClasses)
+    doFirst {
+        val dependencies = files(unit.get().classpath, unit.get().testClassesDirs)
+        setArgs(listOf("-no-stdlib", "-no-reflect", "-Xskip-metadata-version-check", "-jvm-target", "17",
+            "-classpath", dependencies.asPath,
+            "-Xfriend-paths=" + dependencies.files.joinToString(","),
+            "-d", gapFixtureClasses.get().asFile.path) + sources.files.map { it.path })
+    }
+}
+
+val compileGapReproductions = tasks.register<JavaCompile>("compileGapReproductions") {
+    val unit = tasks.named<Test>("testDebugUnitTest")
+    dependsOn(compileGapFixtures)
     source(fileTree("src/gapReproduction/java") { include("**/*.java") })
-    classpath = files(unit.get().classpath, unit.get().testClassesDirs)
+    classpath = files(unit.get().classpath, unit.get().testClassesDirs, gapFixtureClasses)
     destinationDirectory.set(layout.buildDirectory.dir("classes/gapReproduction"))
     options.release.set(17)
 }
@@ -63,7 +88,7 @@ listOf("gap4Reproduction" to "Gap4ReproductionTest", "gap6Reproduction" to "Gap6
         val unit = tasks.named<Test>("testDebugUnitTest")
         dependsOn(compileGapReproductions)
         testClassesDirs = files(compileGapReproductions.flatMap { it.destinationDirectory })
-        classpath = files(testClassesDirs, unit.get().classpath, unit.get().testClassesDirs)
+        classpath = files(testClassesDirs, unit.get().classpath, unit.get().testClassesDirs, gapFixtureClasses)
         include("**/$suite.class")
         outputs.upToDateWhen { false }
     }

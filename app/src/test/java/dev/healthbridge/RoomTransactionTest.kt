@@ -4,6 +4,9 @@ import android.content.Context
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import java.util.UUID
+import java.io.File
+import java.nio.file.Files
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.*
@@ -93,6 +96,73 @@ class RoomTransactionTest {
         assertTrue(failed)
         db.close(); reopen()
         assertEquals(old, db.store().cursors())
+    }
+
+    @Test fun processHaltBetweenPendingDeleteAndStatusWriteRollsBackOnReopen() = runBlocking {
+        db.store().cursors(old)
+        db.store().put(pending)
+        val before = SyncStatus(lastSuccess = "before", result = "before")
+        db.store().status(before)
+        val path = context.getDatabasePath(name)
+        db.close()
+        val evidence = Files.createTempDirectory("hb-room-crash-").toFile()
+        val marker = File(evidence, "before-halt.txt")
+        val log = File(evidence, "child.log")
+        val command = mutableListOf(File(System.getProperty("java.home"), "bin/java").path,
+            "-Drobolectric.dependency.repo.url=https://repo.maven.apache.org/maven2",
+            "-Dhb.room.path=${path.absolutePath}", "-Dhb.room.marker=${marker.absolutePath}")
+        for (key in listOf("robolectric.offline", "robolectric.dependency.dir")) {
+            System.getProperty(key)?.let { command += "-D$key=$it" }
+        }
+        command += listOf("-cp", checkNotNull(System.getProperty("hb.test.runtime.classpath")), "dev.healthbridge.RoomCrashProcess")
+        val process = ProcessBuilder(command).redirectErrorStream(true).redirectOutput(log).start()
+        try {
+            assertTrue("Room child must exit; raw log $log", process.waitFor(45, TimeUnit.SECONDS))
+            assertEquals("Room child must halt mid-transaction; raw log $log", 73, process.exitValue())
+            assertEquals("inTransaction=true pending=0 cursor=2026-11-02T00:00:00Z beforeStatus=true", marker.readText())
+            for (suffix in listOf("", "-wal", "-shm", "-journal")) {
+                val file = File(path.path + suffix)
+                if (file.exists()) file.copyTo(File(evidence, "crashed.db$suffix"))
+            }
+        } finally { if (process.isAlive) process.destroyForcibly() }
+        reopen()
+        assertEquals(old, db.store().cursors())
+        assertArrayEquals(pending.body, db.store().pending()!!.body)
+        assertEquals(before, db.store().status())
+        println("ROOM_PROCESS_CRASH evidence=$evidence exit=73 reopened=original-cursor-pending-status")
+    }
+
+    @Test fun processHaltBetweenCursorTargetsRollsBackOnReopen() = runBlocking {
+        db.store().cursors(old)
+        val before = SyncStatus(lastSuccess = "before", result = "before")
+        db.store().status(before)
+        val path = context.getDatabasePath(name)
+        db.close()
+        val evidence = Files.createTempDirectory("hb-room-crash-").toFile()
+        val marker = File(evidence, "before-halt.txt")
+        val log = File(evidence, "child.log")
+        val command = mutableListOf(File(System.getProperty("java.home"), "bin/java").path,
+            "-Drobolectric.dependency.repo.url=https://repo.maven.apache.org/maven2",
+            "-Dhb.room.mode=cursor", "-Dhb.room.path=${path.absolutePath}", "-Dhb.room.marker=${marker.absolutePath}")
+        for (key in listOf("robolectric.offline", "robolectric.dependency.dir")) {
+            System.getProperty(key)?.let { command += "-D$key=$it" }
+        }
+        command += listOf("-cp", checkNotNull(System.getProperty("hb.test.runtime.classpath")), "dev.healthbridge.RoomCrashProcess")
+        val process = ProcessBuilder(command).redirectErrorStream(true).redirectOutput(log).start()
+        try {
+            assertTrue("Room child must exit; raw log $log", process.waitFor(45, TimeUnit.SECONDS))
+            assertEquals("Room child must halt mid-transaction; raw log $log", 73, process.exitValue())
+            assertEquals("inTransaction=true pending=0 cursor=2026-11-02T00:00:00Z beforeStatus=true", marker.readText())
+            for (suffix in listOf("", "-wal", "-shm", "-journal")) {
+                val file = File(path.path + suffix)
+                if (file.exists()) file.copyTo(File(evidence, "crashed.db$suffix"))
+            }
+        } finally { if (process.isAlive) process.destroyForcibly() }
+        reopen()
+        assertEquals(old, db.store().cursors())
+        assertNull(db.store().pending())
+        assertEquals(before, db.store().status())
+        println("ROOM_PROCESS_CRASH evidence=$evidence exit=73 reopened=original-cursors-no-pending-status")
     }
 
     @Test fun testSuccessPreservesLastSuccessInSameTransaction() = runBlocking {

@@ -4,7 +4,6 @@ import java.io.File
 import java.time.Instant
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
-import org.junit.Ignore
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -40,10 +39,8 @@ class V011KnownGapsTest {
         assertTrue("#4 retained pre-publication bodies have no durable attempt intent", File(generation, "attempt-intent.json").isFile)
     }
 
-    @Ignore("#4: pre-publication body temp is retained without durable attempt provenance; cleanup is not implemented")
     @Test fun gap4BodyTempSurvivesRestartWithoutAttemptIntent() = crashBeforePublication(DurableBoundary.TEMP_WRITTEN)
 
-    @Ignore("#4: pre-publication durable body is retained without durable attempt provenance; cleanup is not implemented")
     @Test fun gap4DurableBodySurvivesRestartWithoutAttemptIntent() = crashBeforePublication(DurableBoundary.DIRECTORY_SYNCED)
 
     private class DurableCursors : ChunkCursorStore {
@@ -58,7 +55,6 @@ class V011KnownGapsTest {
         }
     }
 
-    @Ignore("#6: three retained DONE generations block the next envelope at quota; retention policy is unchanged")
     @Test fun gap6ThreeProvenDoneGenerationsPreventNextEnvelopeAdmission() = runBlocking {
         val root = temporary.newFolder()
         val cursors = DurableCursors()

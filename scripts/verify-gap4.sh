@@ -76,8 +76,10 @@ PY
 git rev-parse HEAD hb/phase23-integration hb/v0.1.1-gate-candidate > "$results/refs-after.txt"
 cmp "$results/refs-before.txt" "$results/refs-after.txt"
 git diff --exit-code 3be5bd332b3fc94382dea917c883b3a1300e81de -- \
-    docs/v011-candidate-analysis.md app/src/test/java/dev/healthbridge/V011KnownGapsTest.kt \
+    docs/v011-candidate-analysis.md \
     app/src/main/java/dev/healthbridge/Store.kt app/src/main/java/dev/healthbridge/SyncControl.kt \
-    app/build.gradle.kts > "$results/preserved-files.diff"
+    > "$results/preserved-files.diff"
 git diff --check
 printf 'Verification complete: %s\n' "$results"
+
+scripts/check-gap4-preservation.sh

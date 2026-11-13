@@ -239,6 +239,6 @@ class OutboxEnvelopeTest {
             assertTrue(total(root) <= OUTBOX_HARD_QUOTA_BYTES)
         }
         assertTrue(observed > 0)
-        assertEquals(3, root.listFiles()!!.count { it.isDirectory })
+        assertEquals(5, root.listFiles()!!.count { it.isDirectory })
     }
 }

@@ -68,8 +68,7 @@ class ChunkIoFailureTest {
             assertEquals(label, ChunkReason.IO_FAILURE, status.reason)
             assertNotNull(label, failedFiles)
             assertEquals(label, 0, writesAfterFailure)
-            if (h.outbox.load() == null) assertTrue(label, snapshot(h.root).isEmpty())
-            else assertEquals(label, failedFiles, snapshot(h.root))
+            assertEquals(label, failedFiles, snapshot(h.root))
             if (!published) assertTrue(label, failedFiles!!.keys.any { it.endsWith("${write.name}.tmp") })
             val expectedSends = when (write.phase) {
                 ChunkPhase.SEND, ChunkPhase.ACK -> write.acked

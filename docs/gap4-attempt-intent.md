@@ -1,3 +1,6 @@
+> Historical implementation report. The [addendum](gap4-addendum-verification.md)
+> restores base cleanup behavior. New intent-bearing DONE data remains retained.
+
 # Durable attempt intent
 
 This change adds provenance for newly owned fresh-sync generations. #4 remains OPEN.

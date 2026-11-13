@@ -35,7 +35,10 @@ class DoneRetentionTest {
         val runner = ChunkSync(outbox, cursors, { id, _ -> ChunkResponse(200, "{\"ok\":true,\"batchId\":\"$id\"}") },
             newId = { "g$number-${next++}" }, clock = { number * 1000L }, limits = ChunkLimits(count = 1))
         assertEquals(ChunkPhase.DONE, runBlocking { runner.run(true, "https://synthetic.invalid", syntheticMapping) { input } }.phase)
-        return outbox.load()!!
+        val manifest = outbox.load()!!
+        makeSyntheticLegacyGeneration(root, manifest.generation)
+        runBlocking { outbox.reclaimDone(cursors) }
+        return manifest
     }
     private fun fixture(): Triple<File, Cursors, List<ChunkManifest>> {
         val root = temporary.newFolder()
@@ -136,59 +139,6 @@ class DoneRetentionTest {
         before = inventory(root)
         runBlocking { ChunkOutbox(root).reclaimDone(cursors) }
         assertEquals(before, inventory(root))
-    }
-
-    @Test fun releaseRestartsAfterIntentAndReservationMetadataRemoval() {
-        for (metadataBoundary in listOf(2, 3)) {
-            val (root, cursors, manifests) = fixture()
-            var releasedGeneration: String? = null
-            val retained = manifests.takeLast(3).associate { it.generation to inventory(File(root, it.generation)) }
-            var removed = 0
-            val outbox = ChunkOutbox(root, releaseFault = { boundary, id ->
-                if (boundary == ReleaseBoundary.METADATA_REMOVED && ++removed == metadataBoundary) {
-                    releasedGeneration = id
-                    throw ProcessDeath()
-                }
-            })
-            assertThrows(ProcessDeath::class.java) { runBlocking { outbox.reclaimDone(cursors) } }
-            val oldest = File(root, checkNotNull(releasedGeneration))
-            assertTrue(manifests.take(2).any { it.generation == oldest.name })
-            assertFalse(File(oldest, ATTEMPT_INTENT_NAME).exists())
-            assertEquals(metadataBoundary == 2, File(oldest, "reservation").exists())
-            assertTrue(File(oldest, "manifest.json").isFile)
-            assertTrue(File(root, "receipt-${oldest.name}.json").isFile)
-            assertTrue(oldest.listFiles()!!.none { it.name.startsWith("child-") })
-            runBlocking { ChunkOutbox(root).reclaimDone(cursors) }
-            manifests.take(2).forEach { assertFalse(File(root, it.generation).exists()) }
-            retained.forEach { (id, bytes) -> assertEquals(bytes, inventory(File(root, id))) }
-        }
-    }
-
-    @Test fun malformedIntentCannotAuthorizeCompletedRelease() {
-        val (root, cursors, manifests) = fixture()
-        File(root, "${manifests[0].generation}/$ATTEMPT_INTENT_NAME").writeText("malformed")
-        val second = File(root, "${manifests[1].generation}/$ATTEMPT_INTENT_NAME")
-        second.writeText(JSONObject(second.readText()).put("extra", true).toString())
-        val before = inventory(root)
-        runBlocking { ChunkOutbox(root, releaseFault = { _, _ -> error("No release") }).reclaimDone(cursors) }
-        assertEquals(before, inventory(root))
-        assertTrue(root.listFiles()!!.none { it.name.startsWith("receipt-") })
-    }
-
-    @Test fun legacyCompletedReleaseKeepsItsIndependentAuthority() {
-        val (root, cursors, manifests) = fixture()
-        for (m in manifests) {
-            val dir = File(root, m.generation)
-            File(dir, ATTEMPT_INTENT_NAME).delete()
-            val reservation = File(dir, "reservation")
-            val fields = reservation.readLines().toMutableList()
-            fields[5] = (fields[5].toLong() - 2 * attemptIntentBudget(fields[4].toLong())).toString()
-            reservation.writeText(fields.joinToString("\n"))
-        }
-        val retained = manifests.takeLast(3).associate { it.generation to inventory(File(root, it.generation)) }
-        runBlocking { ChunkOutbox(root).reclaimDone(cursors) }
-        manifests.take(2).forEach { assertFalse(File(root, it.generation).exists()) }
-        retained.forEach { (id, bytes) -> assertEquals(bytes, inventory(File(root, id))) }
     }
 
     @Test fun corruptMetadataUnderRecognisedNamesIsNeverReclaimed() {

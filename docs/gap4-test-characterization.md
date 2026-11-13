@@ -1,5 +1,8 @@
 # Gap 4 test-only extension results
 
+Historical report for 37a115d. The [addendum report](gap4-addendum-verification.md)
+supersedes cleanup authority, fixture placement, counts, and Room crash coverage.
+
 This is an execution report, not an independent review. Independent review is
 unassigned. The policy proposal is FOR REVIEW, NOT IMPLEMENTATION in
 [gap4-policy-design.md](gap4-policy-design.md). #4 and #6 remain OPEN.

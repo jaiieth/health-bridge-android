@@ -83,7 +83,7 @@ internal class DurableFiles(
 
     fun write(file: File, bytes: ByteArray, replace: Boolean = true, size: Int = bytes.size, exclusiveTemp: Boolean = false) {
         require(!exclusiveTemp || !replace)
-        check(replace || !existsNoFollow(file))
+        check(replace || !(if (exclusiveTemp) existsNoFollow(file) else file.exists()))
         val temp = File(file.parentFile, file.name + ".tmp")
         if (!exclusiveTemp) FileOutputStream(temp).use {
             it.write(bytes, 0, size)
@@ -99,12 +99,10 @@ internal class DurableFiles(
             fault(DurableBoundary.FILE_SYNCED, file.name)
         }
         if (replace) Files.move(temp.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-        else {
-            // ATOMIC_MOVE permits replacement on Linux. Same-directory moves use rename;
-            // the caller mutex excludes concurrent writers while the provider checks the target.
+        else if (exclusiveTemp) {
             if (existsNoFollow(file)) throw FileAlreadyExistsException(file.path)
             Files.move(temp.toPath(), file.toPath())
-        }
+        } else Files.move(temp.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE)
         fault(DurableBoundary.RENAMED, file.name)
         syncDirectory(checkNotNull(file.parentFile))
         fault(DurableBoundary.DIRECTORY_SYNCED, file.name)
@@ -249,7 +247,7 @@ internal class ChunkOutbox(
         check(!dir.exists())
         files.directory(root)
         files.directory(dir)
-        val attempt = StagingAttempt(this, reservation.generation, sha256(intentBytes))
+        val attempt = StagingAttempt(this, reservation.generation)
         try {
             files.write(File(dir, "reservation"), reservation.bytes(), replace = false)
             files.write(File(dir, ATTEMPT_INTENT_NAME), intentBytes, replace = false, exclusiveTemp = true)
@@ -298,21 +296,17 @@ internal class ChunkOutbox(
 
     fun rollback(attempt: StagingAttempt) {
         require(attempt.owner === this)
+        durableIntents.remove(attempt.generation)
         val dir = generation(attempt.generation)
         // Once published, preserve the complete resumable generation, even if its fsync reported failure.
         if (File(root, "active").let { it.exists() && it.readText() == attempt.generation }) return
-        val intentFile = File(dir, ATTEMPT_INTENT_NAME)
-        if (existsNoFollow(intentFile) && runCatching {
-                requireRegular(intentFile)
-                require(sha256(intentFile.readBytes()) == attempt.intentSha)
-            }.isFailure) return
         val committed = File(dir, "manifest.json")
         if (committed.exists()) {
             val manifest = try { decode(committed.readText()) } catch (_: Exception) { return }
             if (manifest.generation != attempt.generation || manifest.phase !in setOf(ChunkPhase.STAGE, ChunkPhase.BLOCKED) ||
                 manifest.children.any { it.acked || it.sentAt != null } || manifest.reason == ChunkReason.UNKNOWN_ACCEPTANCE) return
         }
-        val allowed = Regex("child-[0-9]+\\.json(\\.tmp)?|(manifest|published)\\.json(\\.tmp)?|reservation(\\.tmp)?|attempt-intent\\.json(\\.tmp)?")
+        val allowed = Regex("child-[0-9]+\\.json(\\.tmp)?|(manifest|published)\\.json(\\.tmp)?|reservation(\\.tmp)?")
         val entries = dir.listFiles() ?: return
         if (entries.any { !it.isFile || !allowed.matches(it.name) }) return
         val proof = File(root, "active-proof")
@@ -326,7 +320,6 @@ internal class ChunkOutbox(
         Files.deleteIfExists(dir.toPath())
         File(root, "active.tmp").let { if (it.exists() && it.readText() == attempt.generation) Files.delete(it.toPath()) }
         files.sync(root)
-        durableIntents.remove(attempt.generation)
     }
 
     private fun readReservation(file: File, id: String): Reservation {
@@ -334,7 +327,7 @@ internal class ChunkOutbox(
         return parseReservation(file.readLines(), id)
     }
 
-    private fun parseReservation(fields: List<String>, id: String): Reservation {
+    private fun parseReservation(fields: List<String>, id: String, allowIntent: Boolean = false): Reservation {
         require((fields.size == 7 && fields[0] == "1") || (fields.size == 8 && fields[0] == "2"))
         require(fields[1] == id)
         generation(id)
@@ -344,15 +337,21 @@ internal class ChunkOutbox(
         require(r.retained in 0..OUTBOX_HARD_QUOTA_BYTES && r.bodies in 0..OUTBOX_HARD_QUOTA_BYTES &&
             r.manifest in 1..FreshGenerationLimits().manifestBytes && r.limit in 0..OUTBOX_HARD_QUOTA_BYTES &&
             r.controls in 0..OUTBOX_CONTROL_RESERVE_BYTES)
-        require(r.peak == r.legacyPeak() || fields[0] == "2" && r.peak == r.intentPeak())
+        require(r.peak == r.legacyPeak() || allowIntent && fields[0] == "2" && r.peak == r.intentPeak())
         require(r.peak <= r.limit)
         return r
+    }
+
+    private fun readIntentReservation(file: File, id: String): Reservation {
+        requireRegular(file)
+        require(file.length() <= 256)
+        return parseReservation(file.readLines(), id, allowIntent = true)
     }
 
     private fun readIntent(dir: File): AttemptIntent {
         require(dir.isDirectory && !Files.isSymbolicLink(dir.toPath()))
         val reservationFile = File(dir, "reservation")
-        val r = readReservation(reservationFile, dir.name)
+        val r = readIntentReservation(reservationFile, dir.name)
         require(r.peak == r.intentPeak())
         val file = File(dir, ATTEMPT_INTENT_NAME)
         requireRegular(file)
@@ -449,7 +448,7 @@ internal class ChunkOutbox(
             return try { validateIntentGeneration(dir); StagingRecovery.Retain }
             catch (_: Exception) { StagingRecovery.Retain }
         }
-        if (File(dir, "reservation").isFile && runCatching { readReservation(File(dir, "reservation"), dir.name) }
+        if (File(dir, "reservation").isFile && runCatching { readIntentReservation(File(dir, "reservation"), dir.name) }
                 .getOrNull()?.let { it.peak == it.intentPeak() } == true) return StagingRecovery.Retain
         val metadata = listOf("manifest.json", "published.json", "manifest.json.tmp", "published.json.tmp")
             .map { File(dir, it) }.filter { Files.exists(it.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS) }
@@ -658,7 +657,7 @@ internal class ChunkOutbox(
         files.sync(root)
     }
 
-    internal class StagingAttempt internal constructor(internal val owner: ChunkOutbox, internal val generation: String, internal val intentSha: String)
+    internal class StagingAttempt internal constructor(internal val owner: ChunkOutbox, internal val generation: String)
 
     private fun isControl(file: File): Boolean = file.parentFile == root &&
         (file.name.removeSuffix(".tmp") in setOf("active", "active-proof", "previous", "backpressure", "staging-tombstone") ||
@@ -694,7 +693,7 @@ internal class ChunkOutbox(
     }
 
     private fun readReceipt(file: File): Receipt? = try {
-        require(file.isFile && !Files.isSymbolicLink(file.toPath()) && file.length() <= CONTROL_RECORD_BYTES)
+        require(file.isFile && file.length() <= CONTROL_RECORD_BYTES)
         val j = JSONObject(file.readText())
         require(j.getString("format") == "health-bridge-completed-v1" && j.length() == 10)
         val id = j.getString("generation")
@@ -711,6 +710,18 @@ internal class ChunkOutbox(
         receipt
     } catch (_: Exception) { null }
 
+    private fun referencedGenerations(): Set<String> {
+        val ids = mutableSetOf<String>()
+        for (name in listOf("active", "active.tmp", "active-proof", "active-proof.tmp", "previous", "previous.tmp")) {
+            val pointer = File(root, name)
+            if (!pointer.exists()) continue
+            require(pointer.isFile && pointer.length() <= CONTROL_RECORD_BYTES)
+            val lines = pointer.readLines()
+            ids += if (name.removeSuffix(".tmp") == "active") pointer.readText() else lines.getOrNull(1) ?: error("UNKNOWN_POINTER")
+        }
+        return ids
+    }
+
     private fun recognisedMetadata(dir: File, id: String, fingerprint: String, current: ChunkManifest? = null): Boolean = try {
         val publication = File(dir, "published.json")
         if (publication.exists()) {
@@ -726,16 +737,6 @@ internal class ChunkOutbox(
         if (reservation.exists()) {
             require(reservation.isFile && reservation.length() <= 256)
             readReservation(reservation, id)
-        }
-        if (existsNoFollow(File(dir, ATTEMPT_INTENT_NAME))) {
-            val intent = readIntent(dir)
-            require(intent.generation == id && intent.fingerprint == fingerprint)
-            if (current != null) require(intent.matches(current))
-            require(dir.listFiles()!!.all { !Files.isSymbolicLink(it.toPath()) && it.isFile })
-            for (child in intent.children) {
-                val body = File(dir, child.finalName)
-                if (body.exists()) require(body.length() == child.bodyBytes && sha256(body.readBytes()) == child.bodySha)
-            }
         }
         true
     } catch (_: Exception) { false }
@@ -754,7 +755,7 @@ internal class ChunkOutbox(
         require(m.children.map { it.batchId }.distinct().size == m.children.size)
         require(m.children.sumOf { it.count } == m.recordIds.size && m.updatedAt >= 0)
         require(m.children.all { it.acked && it.sentAt != null && it.ackedAt != null && receiverBatchId.matches(it.batchId) })
-        val allowed = setOf("manifest.json", "published.json", "reservation", ATTEMPT_INTENT_NAME) + m.children.map { "child-${it.index}.json" }
+        val allowed = setOf("manifest.json", "published.json", "reservation") + m.children.map { "child-${it.index}.json" }
         require(dir.listFiles()!!.all { it.isFile && it.name in allowed })
         require(recognisedMetadata(dir, m.generation, m.fingerprint, m))
         m
@@ -780,7 +781,7 @@ internal class ChunkOutbox(
         if (target.exists()) return readReceipt(target) == receipt
         val records = root.listFiles()!!.filter { it.name.matches(Regex("receipt-[a-zA-Z0-9-]{1,100}\\.json")) }
         if (records.size >= COMPLETED_RECEIPT_COUNT) {
-            val referenced = recoveryReferences()
+            val referenced = referencedGenerations()
             val old = records.mapNotNull { file -> readReceipt(file)?.let { file to it } }
                 .filter { (_, r) -> !generation(r.generation).exists() && r.generation !in referenced }
                 .minWithOrNull(compareBy<Pair<File, Receipt>> { it.second.completedAt }.thenBy { it.second.generation }) ?: return false
@@ -793,10 +794,10 @@ internal class ChunkOutbox(
 
     private suspend fun release(receipt: Receipt, cursors: ChunkCursorStore) {
         val dir = generation(receipt.generation)
-        if (!dir.exists() || receipt.generation in recoveryReferences()) return
+        if (!dir.exists() || receipt.generation in referencedGenerations()) return
         if (cursors.hasLegacyPending() || !cursors.committed(receipt.targets)) return
         val entries = dir.listFiles() ?: throw IOException("DIRECTORY_LIST_FAILED")
-        val allowed = setOf("manifest.json", "published.json", "reservation", ATTEMPT_INTENT_NAME) + (0 until receipt.chunkCount).map { "child-$it.json" }
+        val allowed = setOf("manifest.json", "published.json", "reservation") + (0 until receipt.chunkCount).map { "child-$it.json" }
         if (entries.any { !it.isFile || it.name !in allowed }) return
         val manifestFile = File(dir, "manifest.json")
         val m = if (manifestFile.exists()) completedManifest(dir) ?: return else null
@@ -818,7 +819,7 @@ internal class ChunkOutbox(
         files.sync(dir)
         releaseFault(ReleaseBoundary.BODIES_SYNCED, receipt.generation)
         // The manifest survives until every body is gone. A receipt alone recovers metadata removal.
-        for (name in listOf("published.json", ATTEMPT_INTENT_NAME, "reservation", "manifest.json")) {
+        for (name in listOf("published.json", "reservation", "manifest.json")) {
             Files.deleteIfExists(File(dir, name).toPath())
             releaseFault(if (name == "manifest.json") ReleaseBoundary.MANIFEST_REMOVED else ReleaseBoundary.METADATA_REMOVED, receipt.generation)
         }
@@ -837,7 +838,7 @@ internal class ChunkOutbox(
         val proven = candidates.filter { cursors.committed(it.targets) }
             .sortedWith(compareByDescending<ChunkManifest> { it.updatedAt }.thenByDescending { it.generation })
         for (m in proven.drop(RETAINED_DONE_GENERATIONS)) {
-            if (m.generation in recoveryReferences() || cursors.hasLegacyPending()) continue
+            if (m.generation in referencedGenerations() || cursors.hasLegacyPending()) continue
             val receipt = try { makeReceipt(m) } catch (_: Exception) { continue }
             if (admitReceipt(receipt)) release(receipt, cursors)
         }
