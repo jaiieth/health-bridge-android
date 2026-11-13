@@ -3,6 +3,7 @@ name: Android CI
 on:
   push:
     branches: [master, main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -12,6 +13,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -45,9 +47,51 @@ jobs:
             app/build/test-results/**
           if-no-files-found: ignore
 
+      - name: Package APK and provenance
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk dist/health-bridge-debug.apk
+          printf 'commit=%s\nref=%s\nrun=%s\nvariant=debug\n' "$SOURCE_SHA" "$SOURCE_REF" "$RUN_URL" > dist/build-info.txt
+          (cd dist && sha256sum health-bridge-debug.apk > SHA256SUMS.txt)
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           if-no-files-found: error
           name: health-bridge-debug
-          path: app/build/outputs/apk/debug/*.apk
+          path: dist/*
+
+  draft-release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    concurrency:
+      group: draft-release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: health-bridge-debug
+          path: dist
+      - name: Verify packaged checksum
+        run: cd dist && sha256sum --check SHA256SUMS.txt
+      - name: Create draft release only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Fail safely if this tag already has a release: never replace assets or publish.
+          gh release create "$RELEASE_TAG" dist/health-bridge-debug.apk dist/SHA256SUMS.txt dist/build-info.txt \
+            --verify-tag --draft --title "$RELEASE_TAG" \
+            --notes 'CI unit tests, lint and debug build passed for this tag. Assets contain a DEBUG APK, SHA256 checksum and source/run metadata. This is NOT a production-signed APK. CTO must verify signing/update compatibility and real-device sync before publication; this workflow never publishes automatically.'
